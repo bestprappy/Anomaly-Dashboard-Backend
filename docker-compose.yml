@@ -27,14 +27,6 @@ services:
       postgres:
         condition: service_healthy
 
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    container_name: todo-tunnel
-    restart: unless-stopped
-    command: tunnel --no-autoupdate --url http://api:8000
-    depends_on:
-      - api
-
 volumes:
   todo_pgdata:
     external: true

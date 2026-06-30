@@ -10,8 +10,6 @@ services:
         fromDatabase:
           name: todo-db
           property: connectionString
-      - key: CORS_ORIGINS
-        sync: false   # set this to your GitHub Pages origin in the Render dashboard
 
 databases:
   - name: todo-db

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import create_engine, String, Boolean, Integer
@@ -73,11 +74,6 @@ class Todo(TodoIn):
         from_attributes = True
 
 
-@app.get("/")
-def root():
-    return {"message": "Todo List API", "docs": "/docs"}
-
-
 @app.get("/todos", response_model=list[Todo])
 def list_todos(db: Session = Depends(get_db)):
     return db.query(TodoModel).order_by(TodoModel.id).all()
@@ -119,3 +115,8 @@ def delete_todo(todo_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Todo not found")
     db.delete(todo)
     db.commit()
+
+
+# Serve the frontend from the same origin as the API (no CORS, no mixed content).
+# Mounted last so the API routes above take precedence.
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
