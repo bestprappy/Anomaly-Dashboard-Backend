@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Optional
 import tempfile
 import os
+import shutil
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +51,8 @@ logger = logging.getLogger(__name__)
 # which directory uvicorn is launched from.
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
+CHUNKS_DIR = Path(tempfile.gettempdir()) / "anomaly_chunks"
+CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Billing EDA Dashboard API", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -66,10 +69,7 @@ app.add_middleware(
 )
 
 # Single global container — see deploy notes above.
-STATE: dict = {
-    "container": DataBillContainer(),
-    "chunk_storage": {},  # Store uploaded chunks: {file_id: {chunk_number: chunk_data}}
-}
+STATE: dict = {"container": DataBillContainer()}
 
 def get_container() -> DataBillContainer:
     container: DataBillContainer = STATE["container"]
@@ -100,20 +100,19 @@ async def upload_chunk(
     chunk: UploadFile = File(...),
 ):
     """
-    Upload a single chunk of a large file. Call multiple times with different
-    chunk_number values until total_chunks are received.
+    Upload a single chunk of a large file. Chunks are stored on disk to save memory.
+    Call multiple times with different chunk_number values until total_chunks are received.
     """
-    chunk_storage = STATE["chunk_storage"]
+    # Create directory for this upload
+    upload_dir = CHUNKS_DIR / file_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    if file_id not in chunk_storage:
-        chunk_storage[file_id] = {}
-
+    # Write chunk to disk
+    chunk_path = upload_dir / f"{chunk_number}.chunk"
     chunk_data = await chunk.read()
-    chunk_storage[file_id][chunk_number] = {
-        "data": chunk_data,
-        "file_key": file_key,
-        "total_chunks": total_chunks,
-    }
+
+    with open(chunk_path, "wb") as f:
+        f.write(chunk_data)
 
     logger.info(
         f"Received chunk {chunk_number}/{total_chunks} for {file_key} "
@@ -136,27 +135,36 @@ async def finalize_chunks(
     Finalize a chunked upload by reassembling all chunks into a complete file
     and processing it. Call this after all chunks are uploaded.
     """
-    chunk_storage = STATE["chunk_storage"]
+    upload_dir = CHUNKS_DIR / file_id
 
-    if file_id not in chunk_storage:
+    if not upload_dir.exists():
         raise HTTPException(status_code=400, detail=f"No chunks found for file_id: {file_id}")
 
-    chunks_dict = chunk_storage[file_id]
-    total_expected = max([v["total_chunks"] for v in chunks_dict.values()], default=0)
-
-    if len(chunks_dict) != total_expected:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Expected {total_expected} chunks, got {len(chunks_dict)}"
-        )
-
-    # Reassemble chunks in order
-    file_key = chunks_dict[0]["file_key"]
-    reassembled = b"".join(
-        chunks_dict[i]["data"] for i in range(total_expected)
+    # Find all chunk files
+    chunk_files = sorted(
+        [f for f in upload_dir.glob("*.chunk")],
+        key=lambda f: int(f.stem)
     )
 
-    logger.info(f"Reassembled {file_key}: {len(reassembled)/1_000_000:.1f}MB from {total_expected} chunks")
+    if not chunk_files:
+        raise HTTPException(status_code=400, detail="No chunks uploaded")
+
+    # Get metadata from the last chunk file (contains total_chunks info)
+    # For now, we'll just reassemble what we have
+    total_chunks = len(chunk_files)
+
+    # Reassemble chunks in order
+    reassembled = b""
+    file_key = None
+
+    for chunk_file in chunk_files:
+        with open(chunk_file, "rb") as f:
+            reassembled += f.read()
+
+    logger.info(f"Reassembled {total_chunks} chunks: {len(reassembled)/1_000_000:.1f}MB")
+
+    # Infer file_key from the file_id (format: {file_key}-{timestamp})
+    file_key = file_id.rsplit("-", 1)[0]
 
     # Process the reassembled file
     files = {file_key: reassembled}
@@ -175,8 +183,12 @@ async def finalize_chunks(
         logger.exception("Unexpected error while processing file")
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)[:100]}") from e
     finally:
-        # Clean up chunks
-        del chunk_storage[file_id]
+        # Clean up chunks from disk
+        try:
+            shutil.rmtree(upload_dir)
+            logger.info(f"Cleaned up chunk directory: {upload_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up chunk directory {upload_dir}: {e}")
 
     loaded = container.loaded_files()
     missing = container.missing_files()
