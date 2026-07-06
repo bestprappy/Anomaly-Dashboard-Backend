@@ -28,13 +28,13 @@ multi-worker support, swap STATE for a cache (e.g. Redis) or persist
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
-import tempfile
-import os
-import shutil
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,11 +91,14 @@ def health():
     return {"status": "ok"}
 
 
+VALID_FILE_KEYS = {"pea_bfkt", "pea_tuc", "mea_bfkt", "mea_tuc", "mea_tmv"}
+
+
 @app.post("/api/upload/chunk")
 async def upload_chunk(
     file_id: str = Query(..., description="Unique file identifier"),
-    chunk_number: int = Query(..., description="Chunk sequence number starting from 0"),
-    total_chunks: int = Query(..., description="Total number of chunks for this file"),
+    chunk_number: int = Query(..., ge=0, description="Chunk sequence number starting from 0"),
+    total_chunks: int = Query(..., ge=1, description="Total number of chunks for this file"),
     file_key: str = Query(..., description="Which file this chunk belongs to (pea_bfkt, etc)"),
     chunk: UploadFile = File(...),
 ):
@@ -103,19 +106,28 @@ async def upload_chunk(
     Upload a single chunk of a large file. Chunks are stored on disk to save memory.
     Call multiple times with different chunk_number values until total_chunks are received.
     """
-    # Create directory for this upload
+    if file_key not in VALID_FILE_KEYS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid file_key '{file_key}'. Must be one of: {sorted(VALID_FILE_KEYS)}"
+        )
+    # file_id becomes a directory name — reject anything that could escape CHUNKS_DIR
+    if "/" in file_id or "\\" in file_id or ".." in file_id:
+        raise HTTPException(status_code=422, detail="Invalid file_id.")
+
     upload_dir = CHUNKS_DIR / file_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write chunk to disk
-    chunk_path = upload_dir / f"{chunk_number}.chunk"
-    chunk_data = await chunk.read()
+    # Persist metadata so finalize doesn't have to guess the file_key from the id
+    meta_path = upload_dir / "meta.json"
+    if not meta_path.exists():
+        meta_path.write_text(json.dumps({"file_key": file_key, "total_chunks": total_chunks}))
 
-    with open(chunk_path, "wb") as f:
-        f.write(chunk_data)
+    chunk_data = await chunk.read()
+    (upload_dir / f"{chunk_number}.chunk").write_bytes(chunk_data)
 
     logger.info(
-        f"Received chunk {chunk_number}/{total_chunks} for {file_key} "
+        f"Received chunk {chunk_number + 1}/{total_chunks} for {file_key} "
         f"(file_id={file_id}, size={len(chunk_data)/1_000_000:.1f}MB)"
     )
 
@@ -132,53 +144,54 @@ async def finalize_chunks(
     file_id: str = Query(..., description="File ID from chunk uploads"),
 ):
     """
-    Finalize a chunked upload by reassembling all chunks into a complete file
-    and processing it. Call this after all chunks are uploaded.
+    Finalize a chunked upload: verify all chunks arrived, reassemble them into a
+    single file on disk (never in RAM), then load and process it.
     """
-    upload_dir = CHUNKS_DIR / file_id
+    if "/" in file_id or "\\" in file_id or ".." in file_id:
+        raise HTTPException(status_code=422, detail="Invalid file_id.")
 
+    upload_dir = CHUNKS_DIR / file_id
     if not upload_dir.exists():
         raise HTTPException(status_code=400, detail=f"No chunks found for file_id: {file_id}")
 
-    # Find all chunk files
-    chunk_files = sorted(
-        [f for f in upload_dir.glob("*.chunk")],
-        key=lambda f: int(f.stem)
-    )
+    meta_path = upload_dir / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=400, detail="Upload metadata missing; please re-upload.")
+    meta = json.loads(meta_path.read_text())
+    file_key: str = meta["file_key"]
+    total_chunks: int = meta["total_chunks"]
 
-    if not chunk_files:
-        raise HTTPException(status_code=400, detail="No chunks uploaded")
+    # Verify every chunk 0..N-1 is present before assembling
+    missing_chunks = [
+        i for i in range(total_chunks)
+        if not (upload_dir / f"{i}.chunk").exists()
+    ]
+    if missing_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing chunks {missing_chunks[:10]} of {total_chunks}. Please re-upload."
+        )
 
-    # Get metadata from the last chunk file (contains total_chunks info)
-    # For now, we'll just reassemble what we have
-    total_chunks = len(chunk_files)
-
-    # Infer file_key from the file_id (format: {file_key}-{timestamp})
-    file_key = file_id.rsplit("-", 1)[0]
-
-    # Reassemble chunks into a BytesIO stream instead of loading all into memory
-    reassembled = io.BytesIO()
+    # Reassemble on disk (streaming) so a 100MB file never sits in RAM as bytes
+    assembled_path = upload_dir / "assembled.bin"
     total_size = 0
+    with open(assembled_path, "wb") as out:
+        for i in range(total_chunks):
+            chunk_path = upload_dir / f"{i}.chunk"
+            with open(chunk_path, "rb") as f:
+                shutil.copyfileobj(f, out)
+            total_size += chunk_path.stat().st_size
+            chunk_path.unlink()  # free disk as we go
 
-    for chunk_file in chunk_files:
-        with open(chunk_file, "rb") as f:
-            chunk_data = f.read()
-            reassembled.write(chunk_data)
-            total_size += len(chunk_data)
+    logger.info(f"Reassembled {total_chunks} chunks for {file_key}: {total_size/1_000_000:.1f}MB")
 
-    reassembled.seek(0)  # Reset to beginning for reading
-    logger.info(f"Reassembled {total_chunks} chunks: {total_size/1_000_000:.1f}MB")
-
-    # Process the reassembled file
-    files = {file_key: reassembled}
     container: DataBillContainer = STATE["container"]
-
     try:
         t0 = time.time()
-        container.load_files(files)
+        with open(assembled_path, "rb") as fh:
+            container.load_files({file_key: fh})
         container.build_master()
-        t1 = time.time()
-        logger.info(f"✓ Finalized {file_key}: {t1-t0:.1f}s")
+        logger.info(f"✓ Finalized {file_key}: {time.time()-t0:.1f}s")
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=422, detail=f"Failed to process file: {e}") from e
@@ -186,7 +199,6 @@ async def finalize_chunks(
         logger.exception("Unexpected error while processing file")
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)[:100]}") from e
     finally:
-        # Clean up chunks from disk
         try:
             shutil.rmtree(upload_dir)
             logger.info(f"Cleaned up chunk directory: {upload_dir}")
