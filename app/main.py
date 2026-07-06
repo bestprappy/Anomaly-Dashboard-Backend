@@ -28,6 +28,8 @@ multi-worker support, swap STATE for a cache (e.g. Redis) or persist
 
 from __future__ import annotations
 
+import time
+import logging
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -37,6 +39,9 @@ from fastapi.responses import FileResponse
 
 from app.data_container import DataBillContainer
 from app.schemas import UploadStatus, SiteTrendResponse
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Billing EDA Dashboard API", version="1.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -96,8 +101,9 @@ async def upload_files(
 
     container: DataBillContainer = STATE["container"]
     try:
-        container.load_files(files)
-        container.build_master()
+        t0=time.time(); container.load_files(files); t1=time.time()
+        container.build_master(); t2=time.time()
+        logger.info(f"load={t1-t0:.1f}s build_master={t2-t1:.1f}s")
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Failed to process uploaded file(s): {e}")
 
