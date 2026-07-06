@@ -33,10 +33,15 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass, field
+import time
 from typing import Optional, Union, BinaryIO
 
 import numpy as np
 import pandas as pd
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 FileLike = Union[str, bytes, BinaryIO]
 
@@ -64,16 +69,30 @@ def _read_any(file: FileLike, header=0) -> pd.DataFrame:
     if hasattr(file, "read"):
         pos = file.tell() if hasattr(file, "tell") else None
         try:
-            return pd.read_csv(file, header=header)
+            df = pd.read_csv(file, header=header, low_memory=False)
+            if df.shape[1] <= 1:  # single-column result usually means it wasn't really CSV
+                raise ValueError("suspicious single-column parse")
+            return df
         except Exception:
             if pos is not None:
                 file.seek(pos)
             return pd.read_excel(file, header=header)
-    # str path
     if str(file).lower().endswith((".xlsx", ".xls")):
         return pd.read_excel(file, header=header)
-    return pd.read_csv(file, header=header)
+    return pd.read_csv(file, header=header, low_memory=False)
 
+def _clean_numeric_string(series: pd.Series) -> pd.Series:
+    """
+    Clean PEA/MEA numeric columns before pd.to_numeric:
+      - strip whitespace/quotes
+      - treat '-' (dash placeholder for zero) as 0
+      - strip thousands-separator commas
+    """
+    s = series.astype(str).str.strip().str.strip('"').str.strip()
+    s = s.replace(r'^-+$', '0', regex=True)   # bare dash(es) -> 0
+    s = s.str.replace(',', '', regex=False)
+    s = s.str.strip()
+    return s
 
 def _fix_numeric_col(col) -> str:
     try:
@@ -140,20 +159,16 @@ class DataBillContainer:
     # ------------------------------------------------------------------
 
     def load_files(self, files: dict[str, FileLike]) -> None:
-        """
-        files: dict with any subset of keys in REQUIRED_FILES mapped to an
-        uploaded file (path / bytes / file-like object).
-        """
         if "pea_bfkt" in files:
-            self._load_pea("BFKT", files["pea_bfkt"])
+            t0=time.time(); self._load_pea("BFKT", files["pea_bfkt"]); logger.info(f"pea_bfkt load={time.time()-t0:.1f}s")
         if "pea_tuc" in files:
-            self._load_pea("TUC", files["pea_tuc"])
+            t0=time.time(); self._load_pea("TUC", files["pea_tuc"]); logger.info(f"pea_tuc load={time.time()-t0:.1f}s")
         if "mea_bfkt" in files:
-            self._load_mea("BFKT", files["mea_bfkt"])
+            t0=time.time(); self._load_mea("BFKT", files["mea_bfkt"]); logger.info(f"mea_bfkt load={time.time()-t0:.1f}s")
         if "mea_tuc" in files:
-            self._load_mea("TUC", files["mea_tuc"])
+            t0=time.time(); self._load_mea("TUC", files["mea_tuc"]); logger.info(f"mea_tuc load={time.time()-t0:.1f}s")
         if "mea_tmv" in files:
-            self._load_mea("TMV", files["mea_tmv"])
+            t0=time.time(); self._load_mea("TMV", files["mea_tmv"]); logger.info(f"mea_tmv load={time.time()-t0:.1f}s")
 
     def is_ready(self) -> bool:
         return self.master_df is not None and len(self.master_df) > 0
@@ -231,7 +246,10 @@ class DataBillContainer:
                                  f"in last 3 known months ({recent_unit_cols}).")
 
         raw[amount_cols + unit_cols] = (
-            raw[amount_cols + unit_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            raw[amount_cols + unit_cols]
+            .apply(_clean_numeric_string)
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
         )
 
         type_col = next((c for c in PEA_SITE_TYPE_COL_CANDIDATES if c in raw.columns), None)
@@ -274,7 +292,7 @@ class DataBillContainer:
         report.rows_raw = len(raw)
 
         # drop the trailing summary row(s) — Meter_No must be numeric there
-        raw = raw[raw[MEA_METER_COL].apply(lambda x: str(x).replace('.', '').isdigit())].copy()
+        raw = raw[pd.to_numeric(raw[MEA_METER_COL], errors='coerce').notna()]
         raw[MEA_METER_COL] = pd.to_numeric(raw[MEA_METER_COL], errors='coerce')
         raw = raw.dropna(subset=[MEA_METER_COL])
 
@@ -437,6 +455,8 @@ class DataBillContainer:
 
     def _melt_mea(self, raw: pd.DataFrame) -> pd.DataFrame:
         amt_cols, unit_cols = self._mea_month_columns(raw)
+        logger.info(f"[{raw['company'].iloc[0]}] amt_cols={len(amt_cols)} unit_cols={len(unit_cols)}")
+        logger.info(f"[{raw['company'].iloc[0]}] sample amt_cols: {amt_cols[:5]}")
         id_cols = [c for c in [MEA_METER_COL, 'Site_ID', 'company', 'provider', 'site_type',
                                 'Rate_CAT', 'TOU&TOD', 'Province', 'Input_Date', 'Remark']
                    if c in raw.columns]
@@ -465,6 +485,8 @@ class DataBillContainer:
 
         all_months = sorted(merged['month'].unique())
         keys = merged[[MEA_METER_COL, 'company']].drop_duplicates()
+        logger.info(f"[{raw['company'].iloc[0]}] unique_meters={len(keys)} unique_months={len(all_months)} "
+                    f"spine_size={len(keys)*len(all_months)}")
         spine = keys.merge(pd.DataFrame({'month': all_months}), how='cross')
         merged = spine.merge(merged, on=[MEA_METER_COL, 'company', 'month'], how='left')
 
