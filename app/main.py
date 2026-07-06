@@ -153,18 +153,21 @@ async def finalize_chunks(
     # For now, we'll just reassemble what we have
     total_chunks = len(chunk_files)
 
-    # Reassemble chunks in order
-    reassembled = b""
-    file_key = None
+    # Infer file_key from the file_id (format: {file_key}-{timestamp})
+    file_key = file_id.rsplit("-", 1)[0]
+
+    # Reassemble chunks into a BytesIO stream instead of loading all into memory
+    reassembled = io.BytesIO()
+    total_size = 0
 
     for chunk_file in chunk_files:
         with open(chunk_file, "rb") as f:
-            reassembled += f.read()
+            chunk_data = f.read()
+            reassembled.write(chunk_data)
+            total_size += len(chunk_data)
 
-    logger.info(f"Reassembled {total_chunks} chunks: {len(reassembled)/1_000_000:.1f}MB")
-
-    # Infer file_key from the file_id (format: {file_key}-{timestamp})
-    file_key = file_id.rsplit("-", 1)[0]
+    reassembled.seek(0)  # Reset to beginning for reading
+    logger.info(f"Reassembled {total_chunks} chunks: {total_size/1_000_000:.1f}MB")
 
     # Process the reassembled file
     files = {file_key: reassembled}
