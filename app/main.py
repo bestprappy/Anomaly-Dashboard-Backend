@@ -68,7 +68,7 @@ def get_container() -> DataBillContainer:
     return container
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return FileResponse("static/index.html")
 
