@@ -32,6 +32,8 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional
+import tempfile
+import os
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,7 +66,10 @@ app.add_middleware(
 )
 
 # Single global container — see deploy notes above.
-STATE: dict = {"container": DataBillContainer()}
+STATE: dict = {
+    "container": DataBillContainer(),
+    "chunk_storage": {},  # Store uploaded chunks: {file_id: {chunk_number: chunk_data}}
+}
 
 def get_container() -> DataBillContainer:
     container: DataBillContainer = STATE["container"]
@@ -86,6 +91,105 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/upload/chunk")
+async def upload_chunk(
+    file_id: str = Query(..., description="Unique file identifier"),
+    chunk_number: int = Query(..., description="Chunk sequence number starting from 0"),
+    total_chunks: int = Query(..., description="Total number of chunks for this file"),
+    file_key: str = Query(..., description="Which file this chunk belongs to (pea_bfkt, etc)"),
+    chunk: UploadFile = File(...),
+):
+    """
+    Upload a single chunk of a large file. Call multiple times with different
+    chunk_number values until total_chunks are received.
+    """
+    chunk_storage = STATE["chunk_storage"]
+
+    if file_id not in chunk_storage:
+        chunk_storage[file_id] = {}
+
+    chunk_data = await chunk.read()
+    chunk_storage[file_id][chunk_number] = {
+        "data": chunk_data,
+        "file_key": file_key,
+        "total_chunks": total_chunks,
+    }
+
+    logger.info(
+        f"Received chunk {chunk_number}/{total_chunks} for {file_key} "
+        f"(file_id={file_id}, size={len(chunk_data)/1_000_000:.1f}MB)"
+    )
+
+    return {
+        "file_id": file_id,
+        "chunk_number": chunk_number,
+        "total_chunks": total_chunks,
+        "status": "chunk_received",
+    }
+
+
+@app.post("/api/upload/finalize", response_model=UploadStatus)
+async def finalize_chunks(
+    file_id: str = Query(..., description="File ID from chunk uploads"),
+):
+    """
+    Finalize a chunked upload by reassembling all chunks into a complete file
+    and processing it. Call this after all chunks are uploaded.
+    """
+    chunk_storage = STATE["chunk_storage"]
+
+    if file_id not in chunk_storage:
+        raise HTTPException(status_code=400, detail=f"No chunks found for file_id: {file_id}")
+
+    chunks_dict = chunk_storage[file_id]
+    total_expected = max([v["total_chunks"] for v in chunks_dict.values()], default=0)
+
+    if len(chunks_dict) != total_expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {total_expected} chunks, got {len(chunks_dict)}"
+        )
+
+    # Reassemble chunks in order
+    file_key = chunks_dict[0]["file_key"]
+    reassembled = b"".join(
+        chunks_dict[i]["data"] for i in range(total_expected)
+    )
+
+    logger.info(f"Reassembled {file_key}: {len(reassembled)/1_000_000:.1f}MB from {total_expected} chunks")
+
+    # Process the reassembled file
+    files = {file_key: reassembled}
+    container: DataBillContainer = STATE["container"]
+
+    try:
+        t0 = time.time()
+        container.load_files(files)
+        container.build_master()
+        t1 = time.time()
+        logger.info(f"✓ Finalized {file_key}: {t1-t0:.1f}s")
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=422, detail=f"Failed to process file: {e}") from e
+    except Exception as e:
+        logger.exception("Unexpected error while processing file")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)[:100]}") from e
+    finally:
+        # Clean up chunks
+        del chunk_storage[file_id]
+
+    loaded = container.loaded_files()
+    missing = container.missing_files()
+    return UploadStatus(
+        loaded_files=loaded,
+        missing_files=missing,
+        ready=container.is_ready(),
+        rows_total=container.rows_total(),
+        message="All 5 files loaded." if not missing else
+                f"Loaded {len(loaded)}/5 files. Still missing: {missing}",
+    )
+
+
 @app.post("/api/upload", response_model=UploadStatus)
 async def upload_files(
     pea_bfkt: Optional[UploadFile] = File(None),
@@ -98,6 +202,9 @@ async def upload_files(
     Upload some or all of the 5 raw bill files. Can be called multiple times
     to add files incrementally; each call rebuilds the master table from
     whatever has been loaded so far.
+
+    Recommended: upload files one-at-a-time (sequential) for better reliability
+    on resource-constrained servers (e.g. Render free tier).
     """
     incoming = {
         "pea_bfkt": pea_bfkt, "pea_tuc": pea_tuc,
@@ -107,16 +214,20 @@ async def upload_files(
     if not files:
         raise HTTPException(status_code=400, detail="No files were provided.")
 
+    file_summary = {k: f"{len(v) / 1_000_000:.1f}MB" for k, v in files.items()}
+    logger.info(f"Uploading {len(files)} file(s): {file_summary}")
+
     container: DataBillContainer = STATE["container"]
     try:
         t0 = time.time(); container.load_files(files); t1 = time.time()
         container.build_master(); t2 = time.time()
-        logger.info(f"load={t1-t0:.1f}s build_master={t2-t1:.1f}s")
+        logger.info(f"✓ load={t1-t0:.1f}s build_master={t2-t1:.1f}s total={t2-t0:.1f}s")
     except ValueError as e:
+        logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=422, detail=f"Failed to process uploaded file(s): {e}") from e
     except Exception as e:
         logger.exception("Unexpected error while processing uploaded file(s)")
-        raise HTTPException(status_code=422, detail=f"Failed to process uploaded file(s): {e}") from e
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)[:100]}") from e
 
     loaded = container.loaded_files()
     missing = container.missing_files()
