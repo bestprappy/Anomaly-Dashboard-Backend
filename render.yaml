@@ -5,3 +5,5 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /api/health
+    # deploys are triggered by GitHub Actions (deploy hook) after tests pass
+    autoDeploy: false

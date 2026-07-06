@@ -123,10 +123,9 @@ def _normalise_mea_site_type(val) -> str:
 def classify_bill(amount) -> str:
     if pd.isna(amount) or amount == 0:
         return 'zero'
-    elif amount < 200:
+    if 0 < amount < 200:
         return 'maintenance'
-    else:
-        return 'active'
+    return 'active'
 
 
 @dataclass
@@ -173,8 +172,14 @@ class DataBillContainer:
     def is_ready(self) -> bool:
         return self.master_df is not None and len(self.master_df) > 0
 
+    def loaded_files(self) -> list[str]:
+        return sorted(self._loaded_keys)
+
     def missing_files(self) -> list[str]:
         return [k for k in self.REQUIRED_FILES if k not in self._loaded_keys]
+
+    def rows_total(self) -> int:
+        return len(self.master_df) if self.master_df is not None else 0
 
     # ------------------------- PEA loader ------------------------------
 
@@ -183,6 +188,8 @@ class DataBillContainer:
         report = LoadReport(provider="PEA", company=company)
 
         raw = _read_any(file, header=0)
+        if raw.empty:
+            raise ValueError(f"PEA {company} file has no data rows.")
         # first row holds the "real" column names in the original export
         raw = raw.rename(columns=raw.iloc[0]).iloc[1:].reset_index(drop=True)
         report.rows_raw = len(raw)
@@ -291,6 +298,12 @@ class DataBillContainer:
         raw = _read_any(file, header=1)  # real header is row index 1 in MEA exports
         report.rows_raw = len(raw)
 
+        if MEA_METER_COL not in raw.columns:
+            raise ValueError(
+                f"MEA {company} file has no '{MEA_METER_COL}' column — "
+                "is this the right file / export format?"
+            )
+
         # drop the trailing summary row(s) — Meter_No must be numeric there
         raw = raw[pd.to_numeric(raw[MEA_METER_COL], errors='coerce').notna()]
         raw[MEA_METER_COL] = pd.to_numeric(raw[MEA_METER_COL], errors='coerce')
@@ -362,12 +375,13 @@ class DataBillContainer:
         if not candidates:
             return [], []
 
-        first_month = int(str(candidates[0]).split('.')[0])
+        # each block is internally chronological, so the first month that fails
+        # to increase marks the start of the unit block
         boundary = len(candidates)
         running_max = -1
         for i, c in enumerate(candidates):
             m = int(str(c).split('.')[0])
-            if i > 0 and m <= running_max and m == first_month:
+            if i > 0 and m <= running_max:
                 boundary = i
                 break
             running_max = max(running_max, m)
@@ -431,10 +445,12 @@ class DataBillContainer:
         )
         merged = merged.drop(columns=['month_raw'])
 
-        # month_key is Buddhist-era YYYYMM (e.g. 256902) -> convert to Gregorian
-        be_year = merged['month_key'].str[:4].astype(int)
+        # month_key is Buddhist-era YYYYMM (e.g. 256902) -> convert to Gregorian.
+        # Some exports already use Gregorian years, so only shift years >= 2400.
+        year = merged['month_key'].str[:4].astype(int)
         mm = merged['month_key'].str[4:6].astype(int)
-        merged['month'] = (be_year - 543) * 100 + mm
+        year = np.where(year >= 2400, year - 543, year)
+        merged['month'] = year * 100 + mm
         merged = merged.drop(columns=['month_key'])
 
         merged = merged.rename(columns={'RATE_CAT': 'Rate_CAT', 'TOU&TOD': 'TOU_TOD'})
@@ -506,9 +522,9 @@ class DataBillContainer:
             return s[::-1].cummin()[::-1]
 
         merged['_is_zero'] = is_zero
-        trailing = merged.groupby([MEA_METER_COL, 'company'])['_is_zero'].transform(trailing_zero_run)
-        trailing_len = merged.groupby([MEA_METER_COL, 'company'])['trailing_zero' if False else '_is_zero'] \
-            .transform(lambda s: trailing_zero_run(s).sum())
+        grouped_zero = merged.groupby([MEA_METER_COL, 'company'])['_is_zero']
+        trailing = grouped_zero.transform(trailing_zero_run)
+        trailing_len = grouped_zero.transform(lambda s: trailing_zero_run(s).sum())
         immediate = merged['site_type'] == 'DECOM' if 'site_type' in merged.columns else False
         consecutive_shutdown = (trailing == 1) & (trailing_len >= 3)
         merged['is_shutdown'] = (immediate | consecutive_shutdown) if 'site_type' in merged.columns else consecutive_shutdown
@@ -673,7 +689,7 @@ class DataBillContainer:
                 "site_id": r.Site_ID,
                 "provider": r.provider,   # PEA or MEA
                 "company": r.company,     # BFKT / TUC / TMV
-                "site_type": r.site_type,
+                "site_type": None if pd.isna(r.site_type) else str(r.site_type),
                 "bill_amount": float(r.bill_amount),
                 "last_maintenance_month": r.last_maintenance_month.strftime("%Y-%m"),
             }
@@ -742,7 +758,8 @@ class DataBillContainer:
             "found": True,
             "provider": sub['provider'].iloc[0],
             "company": sub['company'].iloc[0],
-            "site_type": sub['site_type'].iloc[0] if 'site_type' in sub.columns else None,
+            "site_type": (None if 'site_type' not in sub.columns or pd.isna(sub['site_type'].iloc[0])
+                          else str(sub['site_type'].iloc[0])),
             "metric": metric,
             "series": [
                 {"month": int(row['month']),

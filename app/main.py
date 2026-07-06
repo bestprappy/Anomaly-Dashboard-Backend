@@ -28,8 +28,9 @@ multi-worker support, swap STATE for a cache (e.g. Redis) or persist
 
 from __future__ import annotations
 
-import time
 import logging
+import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -43,14 +44,21 @@ from app.schemas import UploadStatus, SiteTrendResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Resolve paths relative to the repo root so the app works no matter
+# which directory uvicorn is launched from.
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
+
 app = FastAPI(title="Billing EDA Dashboard API", version="1.0.0")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # Allow the GitHub Pages static frontend (and local dev) to call this API.
+# The API is cookie-less, so credentials stay disabled — a wildcard origin
+# combined with credentials would defeat the browser's CORS protection.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten to your GitHub Pages origin in production
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -70,7 +78,7 @@ def get_container() -> DataBillContainer:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return FileResponse("static/index.html")
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/api/health")
@@ -101,32 +109,35 @@ async def upload_files(
 
     container: DataBillContainer = STATE["container"]
     try:
-        t0=time.time(); container.load_files(files); t1=time.time()
-        container.build_master(); t2=time.time()
+        t0 = time.time(); container.load_files(files); t1 = time.time()
+        container.build_master(); t2 = time.time()
         logger.info(f"load={t1-t0:.1f}s build_master={t2-t1:.1f}s")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Failed to process uploaded file(s): {e}") from e
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to process uploaded file(s): {e}")
+        logger.exception("Unexpected error while processing uploaded file(s)")
+        raise HTTPException(status_code=422, detail=f"Failed to process uploaded file(s): {e}") from e
 
+    loaded = container.loaded_files()
     missing = container.missing_files()
     return UploadStatus(
-        loaded_files=sorted(container._loaded_keys),
+        loaded_files=loaded,
         missing_files=missing,
         ready=container.is_ready(),
-        rows_total=len(container.master_df) if container.master_df is not None else 0,
+        rows_total=container.rows_total(),
         message="All 5 files loaded." if not missing else
-                f"Loaded {len(container._loaded_keys)}/5 files. Still missing: {missing}",
+                f"Loaded {len(loaded)}/5 files. Still missing: {missing}",
     )
 
 
 @app.get("/api/upload/status", response_model=UploadStatus)
 def upload_status():
     container: DataBillContainer = STATE["container"]
-    missing = container.missing_files()
     return UploadStatus(
-        loaded_files=sorted(container._loaded_keys),
-        missing_files=missing,
+        loaded_files=container.loaded_files(),
+        missing_files=container.missing_files(),
         ready=container.is_ready(),
-        rows_total=len(container.master_df) if container.master_df is not None else 0,
+        rows_total=container.rows_total(),
         message="Ready." if container.is_ready() else "Waiting for uploads.",
     )
 
@@ -164,7 +175,12 @@ def eda_site_types():
 def eda_missing_consequence(
     windows: str = Query("3,6,9", description="comma-separated month windows, e.g. 3,6,9")
 ):
-    win = tuple(int(w) for w in windows.split(",") if w.strip())
+    try:
+        win = tuple(int(w) for w in windows.split(",") if w.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="'windows' must be comma-separated integers, e.g. 3,6,9")
+    if not win or any(w <= 0 for w in win):
+        raise HTTPException(status_code=400, detail="'windows' must contain at least one positive integer.")
     return get_container().eda_last_month_missing(windows=win)
 
 
