@@ -30,6 +30,7 @@ Master table schema (self.master_df), one row per site per month:
 
 from __future__ import annotations
 
+import gc
 import io
 import re
 from dataclasses import dataclass, field
@@ -148,7 +149,13 @@ class DataBillContainer:
     REQUIRED_FILES = ["pea_bfkt", "pea_tuc", "mea_bfkt", "mea_tuc", "mea_tmv"]
 
     def __init__(self):
-        self.raw_frames: dict[str, pd.DataFrame] = {}
+        # Per-file melted (long) frames — compact numeric dtypes. The wide raw
+        # frames are discarded right after melting to keep RAM low on small
+        # instances (Render free tier = 512MB).
+        self.long_frames: dict[str, pd.DataFrame] = {}
+        # Tiny Site_ID/company/provider slices kept for the duplicate /
+        # common-site EDA, which needs pre-melt row granularity.
+        self.site_frames: dict[str, pd.DataFrame] = {}
         self.load_reports: dict[str, LoadReport] = {}
         self.master_df: Optional[pd.DataFrame] = None
         self._loaded_keys: set[str] = set()
@@ -285,7 +292,13 @@ class DataBillContainer:
 
         report.rows_after_clean = len(raw)
         report.removed_rows = report.rows_raw - report.rows_after_clean
-        self.raw_frames[key] = raw
+        if 'Site_ID' in raw.columns:
+            self.site_frames[key] = raw[['Site_ID', 'company', 'provider']].copy()
+        # Melt now and discard the wide raw frame — it is by far the biggest
+        # object in memory and nothing downstream needs it after this point.
+        self.long_frames[key] = self._melt_pea(raw)
+        del raw
+        gc.collect()
         self.load_reports[key] = report
         self._loaded_keys.add(key)
 
@@ -339,7 +352,11 @@ class DataBillContainer:
 
         report.rows_after_clean = len(raw)
         report.removed_rows = report.rows_raw - report.rows_after_clean
-        self.raw_frames[key] = raw
+        if 'Site_ID' in raw.columns:
+            self.site_frames[key] = raw[['Site_ID', 'company', 'provider']].copy()
+        self.long_frames[key] = self._melt_mea(raw)
+        del raw
+        gc.collect()
         self.load_reports[key] = report
         self._loaded_keys.add(key)
 
@@ -393,29 +410,24 @@ class DataBillContainer:
     # ------------------------------------------------------------------
 
     def build_master(self) -> pd.DataFrame:
-        """Melt every loaded raw frame to long format and stack into one table."""
-        long_frames = []
-
-        for key, raw in self.raw_frames.items():
-            provider = raw['provider'].iloc[0]
-            company = raw['company'].iloc[0]
-
-            if provider == 'PEA':
-                long_frames.append(self._melt_pea(raw))
-            else:
-                long_frames.append(self._melt_mea(raw))
-
-        if not long_frames:
+        """Stack the per-file long frames (melted at load time) into one table."""
+        if not self.long_frames:
             self.master_df = pd.DataFrame()
             return self.master_df
 
-        master = pd.concat(long_frames, ignore_index=True, sort=False)
+        # Free the previous master before building the new one so both never
+        # coexist in RAM.
+        self.master_df = None
+        gc.collect()
+
+        master = pd.concat(self.long_frames.values(), ignore_index=True, sort=False)
         master['Site_ID'] = master['Site_ID'].astype(str).str.strip().str.upper()
         master['bill_class'] = master['bill_amount'].apply(classify_bill)
         master['date'] = pd.to_datetime(master['month'].astype(int).astype(str), format='%Y%m')
         master = master.sort_values(['provider', 'company', 'Site_ID', 'date']).reset_index(drop=True)
 
         self.master_df = master
+        gc.collect()
         return master
 
     def _melt_pea(self, raw: pd.DataFrame) -> pd.DataFrame:
@@ -572,8 +584,7 @@ class DataBillContainer:
             (across the uploaded files) — this is what the eventual
             groupby(...).first() merge will silently collapse.
         """
-        raws = [df[['Site_ID', 'company', 'provider']] for df in self.raw_frames.values()
-                if 'Site_ID' in df.columns]
+        raws = list(self.site_frames.values())
         if not raws:
             return {"malformed_site_ids": [], "duplicate_site_ids": []}
         combined = pd.concat(raws, ignore_index=True)
@@ -601,9 +612,9 @@ class DataBillContainer:
 
     def eda_common_sites(self) -> dict:
         pea_sites = {c: set(df['Site_ID'].astype(str).str.upper())
-                     for c, df in self.raw_frames.items() if c.startswith('pea_')}
+                     for c, df in self.site_frames.items() if c.startswith('pea_')}
         mea_sites = {c: set(df['Site_ID'].astype(str).str.upper())
-                     for c, df in self.raw_frames.items() if c.startswith('mea_') and 'Site_ID' in df.columns}
+                     for c, df in self.site_frames.items() if c.startswith('mea_')}
 
         def pairwise_common(d: dict):
             out = {}

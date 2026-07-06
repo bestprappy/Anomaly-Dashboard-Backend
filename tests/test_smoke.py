@@ -105,6 +105,68 @@ def test_sites_and_trends(client):
     assert client.get("/api/site/NOPE123/trend").json()["found"] is False
 
 
+def test_chunked_upload_and_finalize(client):
+    """Split a synthetic PEA file into chunks, upload them, finalize, verify."""
+    data = pea_csv("CBR")
+    chunk_size = 40  # tiny chunks so the small fixture still needs several
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+    file_id = "pea_bfkt-1234567890-abc123"
+
+    for i, chunk in enumerate(chunks):
+        resp = client.post(
+            "/api/upload/chunk",
+            params={
+                "file_id": file_id,
+                "chunk_number": i,
+                "total_chunks": len(chunks),
+                "file_key": "pea_bfkt",
+            },
+            files={"chunk": ("blob", io.BytesIO(chunk), "application/octet-stream")},
+        )
+        assert resp.status_code == 200, resp.text
+
+    resp = client.post("/api/upload/finalize", params={"file_id": file_id})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "pea_bfkt" in body["loaded_files"]
+    assert body["rows_total"] > 0
+
+    # the assembled data must parse identically to a direct upload
+    sites = client.get("/api/sites").json()["site_ids"]
+    assert "CBR4017" in sites
+
+
+def test_finalize_rejects_missing_chunks_and_bad_ids(client):
+    # finalize with no chunks at all
+    assert client.post("/api/upload/finalize", params={"file_id": "nope-1-x"}).status_code == 400
+
+    # upload chunk 0 of 3, then finalize -> must report missing chunks
+    client.post(
+        "/api/upload/chunk",
+        params={"file_id": "partial-1-x", "chunk_number": 0,
+                "total_chunks": 3, "file_key": "pea_bfkt"},
+        files={"chunk": ("blob", io.BytesIO(b"abc"), "application/octet-stream")},
+    )
+    resp = client.post("/api/upload/finalize", params={"file_id": "partial-1-x"})
+    assert resp.status_code == 400 and "Missing chunks" in resp.text
+
+    # invalid file_key and path-traversal file_id are rejected
+    resp = client.post(
+        "/api/upload/chunk",
+        params={"file_id": "x-1-y", "chunk_number": 0,
+                "total_chunks": 1, "file_key": "not_a_key"},
+        files={"chunk": ("blob", io.BytesIO(b"abc"), "application/octet-stream")},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/upload/chunk",
+        params={"file_id": "../escape", "chunk_number": 0,
+                "total_chunks": 1, "file_key": "pea_bfkt"},
+        files={"chunk": ("blob", io.BytesIO(b"abc"), "application/octet-stream")},
+    )
+    assert resp.status_code == 422
+
+
 def test_bad_uploads_return_422_with_clear_message(client):
     resp = client.post("/api/upload",
                        files={"pea_bfkt": ("e.csv", io.BytesIO(b"h1,h2\n"), "text/csv")})
