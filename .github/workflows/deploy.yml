@@ -23,7 +23,8 @@ jobs:
           pip install pytest httpx
 
       - name: Run smoke tests
-        run: pytest tests/ -v
+        # python -m puts the repo root on sys.path so `app` is importable
+        run: python -m pytest tests/ -v
 
   deploy:
     needs: test
