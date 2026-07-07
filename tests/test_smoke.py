@@ -100,7 +100,7 @@ def test_upload_and_all_eda_endpoints(client):
     assert up.status_code == 200
     body = up.json()
     assert body["ready"] is True
-    assert body["rows_total"] > 0
+    assert body["rows_total"] == 0
     assert body["missing_files"] == []
 
     for path in ("summary", "bill-range", "duplicates", "common-sites",
@@ -109,6 +109,8 @@ def test_upload_and_all_eda_endpoints(client):
         resp = client.get(f"/api/eda/{path}")
         assert resp.status_code == 200, f"{path}: {resp.text[:300]}"
         resp.json()  # must be valid JSON (no NaN)
+
+    assert client.get("/api/upload/status").json()["rows_total"] > 0
 
 
 def test_bad_windows_param_returns_400(client):
@@ -150,9 +152,12 @@ def test_chunked_upload_and_finalize(client):
     assert body["ready"] is False
     assert "pea_tuc" in body["missing_files"]
 
-    # The assembled data parsed successfully, but dashboard endpoints stay
-    # gated until all required billing files are loaded.
-    assert client.get("/api/sites").status_code == 409
+    # The assembled data parsed successfully, so partial dashboard endpoints
+    # should be available even while the full five-file dataset is incomplete.
+    sites = client.get("/api/sites")
+    assert sites.status_code == 200, sites.text
+    assert "CBR4017" in sites.json()["site_ids"]
+    assert client.get("/api/upload/status").json()["rows_total"] > 0
 
 
 def test_chunk_upload_rejects_bad_sequence_and_metadata(client):

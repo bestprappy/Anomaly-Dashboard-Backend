@@ -165,6 +165,10 @@ class DataBillContainer:
     # ------------------------------------------------------------------
 
     def load_files(self, files: dict[str, FileLike]) -> None:
+        if files:
+            self.master_df = None
+            gc.collect()
+
         if "pea_bfkt" in files:
             t0=time.time(); self._load_pea("BFKT", files["pea_bfkt"]); logger.info(f"pea_bfkt load={time.time()-t0:.1f}s")
         if "pea_tuc" in files:
@@ -176,12 +180,11 @@ class DataBillContainer:
         if "mea_tmv" in files:
             t0=time.time(); self._load_mea("TMV", files["mea_tmv"]); logger.info(f"mea_tmv load={time.time()-t0:.1f}s")
 
+    def has_loaded_data(self) -> bool:
+        return bool(self.long_frames)
+
     def is_ready(self) -> bool:
-        return (
-            self.master_df is not None
-            and len(self.master_df) > 0
-            and not self.missing_files()
-        )
+        return self.has_loaded_data() and not self.missing_files()
 
     def loaded_files(self) -> list[str]:
         return sorted(self._loaded_keys)
@@ -424,11 +427,15 @@ class DataBillContainer:
         self.master_df = None
         gc.collect()
 
-        master = pd.concat(self.long_frames.values(), ignore_index=True, sort=False)
+        master = pd.concat(
+            self.long_frames.values(),
+            ignore_index=True,
+            sort=False,
+            copy=False,
+        )
         master['Site_ID'] = master['Site_ID'].astype(str).str.strip().str.upper()
         master['bill_class'] = master['bill_amount'].apply(classify_bill)
         master['date'] = pd.to_datetime(master['month'].astype(int).astype(str), format='%Y%m')
-        master = master.sort_values(['provider', 'company', 'Site_ID', 'date']).reset_index(drop=True)
 
         self.master_df = master
         gc.collect()
@@ -557,10 +564,15 @@ class DataBillContainer:
     # EDA
     # ------------------------------------------------------------------
 
-    def _df(self) -> pd.DataFrame:
+    def ensure_master(self) -> pd.DataFrame:
         if self.master_df is None:
-            raise RuntimeError("Call build_master() after load_files() first.")
+            if not self.has_loaded_data():
+                raise RuntimeError("Call load_files() first.")
+            return self.build_master()
         return self.master_df
+
+    def _df(self) -> pd.DataFrame:
+        return self.ensure_master()
 
     def eda_bill_range(self) -> dict:
         df = self._df()

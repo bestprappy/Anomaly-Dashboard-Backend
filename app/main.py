@@ -81,11 +81,12 @@ UPLOAD_LOCKS_GUARD = asyncio.Lock()
 
 def get_container() -> DataBillContainer:
     container: DataBillContainer = STATE["container"]
-    if not container.is_ready():
+    if not container.has_loaded_data():
         raise HTTPException(
             status_code=409,
-            detail="No data loaded yet. POST the 5 files to /api/upload first."
+            detail="No data loaded yet. Upload at least one billing file first."
         )
+    container.ensure_master()
     return container
 
 
@@ -230,8 +231,6 @@ def validate_chunk_size(
 
 def load_and_build(container: DataBillContainer, files: dict[str, object]) -> None:
     container.load_files(files)
-    if not container.missing_files():
-        container.build_master()
 
 
 async def finalize_chunk_upload(file_id: str) -> UploadStatus:
