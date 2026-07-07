@@ -38,12 +38,15 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from app import auth
 from app.data_container import DataBillContainer
 from app.schemas import UploadStatus, SiteTrendResponse
 from app.routers.ml_routes import router as ml_router
@@ -64,10 +67,37 @@ FILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
 app = FastAPI(title="Billing EDA Dashboard API", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.include_router(ml_router)
+auth.warn_if_open()
+
+
+class RequireAuthMiddleware(BaseHTTPMiddleware):
+    """Default-deny password gate for every endpoint (docs included).
+
+    Only /api/health (keep-warm pings), /api/auth/login, / and /static stay
+    public — see app/auth.py. OPTIONS passes through so CORS preflights
+    keep working. Denied requests get a bare 401; they still pass back
+    through CORSMiddleware (added after, so it wraps this one) and carry
+    the CORS headers the browser needs to read the error.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or auth.is_public_path(request.url.path):
+            return await call_next(request)
+        if auth.request_is_authorized(request.headers.get("authorization")):
+            return await call_next(request)
+        return JSONResponse(
+            {"detail": "Authentication required. Sign in with the dashboard password."},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+app.add_middleware(RequireAuthMiddleware)
 
 # Allow the GitHub Pages static frontend (and local dev) to call this API.
 # The API is cookie-less, so credentials stay disabled — a wildcard origin
 # combined with credentials would defeat the browser's CORS protection.
+# Auth rides in the Authorization header, which allow_headers covers.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten to your GitHub Pages origin in production
@@ -75,6 +105,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/api/auth/login")
+def login(body: LoginRequest, request: Request):
+    """Exchange the shared password for an expiring bearer token. The
+    password itself is never stored client-side and never logged here."""
+    password = auth.app_password()
+    if password is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Password auth is not configured on the server (APP_PASSWORD is unset).",
+        )
+
+    client_ip = request.client.host if request.client else "unknown"
+    if not auth.LOGIN_RATE_LIMITER.allow(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Wait a few minutes and try again.",
+        )
+
+    if not auth.password_matches(body.password, password):
+        auth.LOGIN_RATE_LIMITER.record_failure(client_ip)
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+
+    auth.LOGIN_RATE_LIMITER.clear(client_ip)
+    token, expires_at = auth.issue_token(password)
+    return {"token": token, "expires_at": expires_at}
 
 # Single global container — see deploy notes above.
 STATE: dict = {"container": DataBillContainer(), "lock": asyncio.Lock()}
