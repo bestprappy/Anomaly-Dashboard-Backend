@@ -8,7 +8,7 @@ class UploadStatus(BaseModel):
     ready: bool
     rows_total: int = 0
     message: str = ""
-
+    dropped_latest_month: Optional[int] = None
 
 class SiteTrendPoint(BaseModel):
     month: int
