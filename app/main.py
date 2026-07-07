@@ -46,6 +46,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.data_container import DataBillContainer
 from app.schemas import UploadStatus, SiteTrendResponse
+from app.routers.ml_routes import router as ml_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ FILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
 
 app = FastAPI(title="Billing EDA Dashboard API", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.include_router(ml_router)
 
 # Allow the GitHub Pages static frontend (and local dev) to call this API.
 # The API is cookie-less, so credentials stay disabled — a wildcard origin
@@ -99,6 +101,7 @@ def upload_status_for(container: DataBillContainer) -> UploadStatus:
         rows_total=container.rows_total(),
         message="All 5 files loaded." if not missing else
                 f"Loaded {len(loaded)}/5 files. Still missing: {missing}",
+        dropped_latest_month=container.dropped_latest_month,
     )
 
 

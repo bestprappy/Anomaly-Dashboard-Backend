@@ -1,142 +1,144 @@
-# Billing EDA Dashboard — Backend
+# ML Module — Site-Jump Anomaly Detection
 
-FastAPI backend for the PEA/MEA billing dashboard. Accepts the 5 raw bill
-exports, cleans + reshapes them with `DataBillContainer` (ported from
-`True_billing.ipynb` and `MEA_cleaning.ipynb`), and serves the EDA
-aggregations the frontend needs.
+This adds a self-contained `app/ml/` package plus `app/routers/ml_routes.py`
+implementing the pipeline from `site_jump_quantile.ipynb` (quantile-regression
+band + step/spike classification) as an API, split into **Process** and
+**Result** steps as requested. **No Isolation Forest** — `quantile_severity`
+(band-widths outside P5/P95) is the only ranking signal.
 
-## Project layout
+It replaces the manual `00_prepare_model_input.ipynb` step: instead of a
+notebook writing `model_input_active.csv` ahead of time, `app/ml/site_filters.py`
++ `app/ml/features.py` do that filtering/feature-building live, straight off
+`DataBillContainer.master_df`, driven by whatever the user picks in the
+Process tab.
+
+## File layout
 
 ```
 app/
-  data_container.py   # DataBillContainer — ingestion, cleaning, EDA aggregations
-  schemas.py           # Pydantic response models
-  main.py              # FastAPI app + routes
-requirements.txt
+  ml/
+    __init__.py
+    config.py          # DropOptions, DateRange, QuantileConfig, ClassifyThresholds — all tunables in one place
+    site_filters.py     # the 4 drop-option checkboxes, built on DataBillContainer's existing eda_* methods
+    missing_rate.py      # per-month missing-rate for the date-range picker
+    features.py           # feature engineering, ported from the notebooks
+    quantile_model.py      # Stage 1: HistGradientBoostingRegressor quantile band + flagging
+    classify.py              # Stage 2: spike_up / step_up / step_down / spike_down / other
+    plotting.py                # matplotlib PNGs for examples + bulk zip download
+    state.py                     # MLRunState — single in-memory run, mirrors main.py's STATE pattern
+    pipeline.py                   # orchestrates the above; only file the router calls into
+    schemas.py                     # pydantic request bodies
+  routers/
+    __init__.py
+    ml_routes.py                    # FastAPI router, prefix /api/ml
 ```
 
-## Run locally
+Each module has one job, so a bug is easy to localize: wrong drop counts ->
+`site_filters.py`; wrong features -> `features.py`; band looks miscalibrated
+-> `quantile_model.py`; a jump classified wrong -> `classify.py` (and only
+`classify.py` — it never refits anything).
 
-```bash
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
-```
+## Integration into your existing repo
 
-Open http://localhost:8000/docs for interactive Swagger docs.
+1. Copy `app/ml/` and `app/routers/` into your backend's `app/` package.
+2. In `main.py`, add:
 
-## The 5 expected uploads
+   ```python
+   from app.routers.ml_routes import router as ml_router
+   app.include_router(ml_router)
+   ```
 
-| form field  | provider | company |
-|-------------|----------|---------|
-| `pea_bfkt`  | PEA      | BFKT    |
-| `pea_tuc`   | PEA      | TUC     |
-| `mea_bfkt`  | MEA      | BFKT    |
-| `mea_tuc`   | MEA      | TUC     |
-| `mea_tmv`   | MEA      | TMV     |
+   (Anywhere after `app = FastAPI(...)` is fine — router registration order
+   doesn't matter.)
 
-Each should be a CSV export of the original wide-format bill sheet (one row
-per meter, one column per month for baht amount, one column per month for
-kWh). `_read_any()` also accepts `.xlsx` directly if that's easier for a
-given vendor export.
-
-**Important CSV caveat:** the original Excel-based cleaning notebooks told
-the "amount" block and "kWh" block of month-columns apart using Excel's
-int-vs-string header typing (a quirk of how `pandas.read_excel` mangles
-duplicate headers). CSV has no such typing — every header is a string — so
-`DataBillContainer._mea_month_columns()` falls back to a **positional**
-split: it walks the monthly columns in file order and cuts the block at the
-point where the month sequence resets back to the first month. This assumes
-the source sheet lists the amount block first, then the kWh block, each in
-chronological order — true for the samples we tested against. If a vendor
-ever exports the two blocks interleaved instead of stacked, this logic will
-need revisiting.
+3. Add to `requirements.txt` if not already present:
+   ```
+   scikit-learn
+   matplotlib
+   ```
+4. No changes needed to `data_container.py` — the ML module only reads
+   `container.master_df` and calls the existing `eda_duplicates()` /
+   `eda_common_sites()` methods, it never mutates the container.
 
 ## API
 
-All endpoints are prefixed `/api`.
+### Process
 
-### Upload
-- `POST /api/upload` — multipart form with any/all of the 5 fields above.
-  Can be called incrementally (e.g. upload 2 files now, 3 more later); each
-  call rebuilds the master table from whatever has been loaded so far.
-- `GET /api/upload/status` — what's loaded / still missing.
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/ml/drop-options` | the 4 checkbox definitions `{value, label}` |
+| POST | `/api/ml/preview` | drop report + per-month missing-rate for a candidate window |
+| POST | `/api/ml/build` | fit the model, return coverage/flagged-rate metrics |
+| GET | `/api/ml/abnormal` | flagged anomalies as `(site_id, month, kwh)` — the plain result the spec asked for |
 
-### EDA
-- `GET /api/eda/summary` — everything below, in one call (good for an
-  overview dashboard that renders several cards from a single fetch).
-- `GET /api/eda/bill-range` — min/max month covered, per provider and overall.
-- `GET /api/eda/duplicates` — malformed `Site_ID`s (don't match
-  `[A-Z]{2,4}\d{3,5}[A-Z]?`, e.g. `CBR4017` / `CBR4017A`) and `Site_ID`s that
-  appear on more than one raw row across the 5 files — i.e. what a
-  `groupby(Site_ID).first()` merge would silently collapse. Hand this list to
-  whoever owns the site master data.
-- `GET /api/eda/common-sites` — site overlap within PEA (BFKT∩TUC), within
-  MEA (all pairs + 3-way), and across PEA↔MEA (same physical site billed by
-  both authorities — worth flagging since it may indicate a
-  double-connection or a site mid-migration between providers).
-- `GET /api/eda/site-types` — count of each site status (NORMAL, WIFI,
-  WIFI_CANCEL, DECOM, ...) per provider.
-- `GET /api/eda/missing-consequence?windows=3,6,9` — sites with zero/missing
-  kWh for *all* of the last N months, for N in the given windows. These are
-  candidate "silently shut down but never marked DECOM" stations.
-- `GET /api/eda/maintenance-sites` — value_counts of bill amounts inside the
-  0–200 baht "maintenance" bucket. Recurring exact amounts (e.g. many sites
-  billed exactly ฿49.39) usually mean a flat maintenance/rental fee — useful
-  to show a vendor as "these X sites are billed a suspicious flat fee".
-- `GET /api/eda/error-rates` — headline sanity-check numbers: zero-bill
-  rate, bill-without-kWh rate, kWh-without-bill rate, missing-kWh rate,
-  negative values, plus the row-by-row ingestion log (`load_reports`) so you
-  can see exactly what got dropped from each raw file and why.
+**POST /api/ml/preview**
+```json
+{
+  "drop_options": {"duplicate_site": true, "shutdown_site": true},
+  "start_month": 202301,
+  "end_month": 202612
+}
+```
+Returns `drop_report` (how many sites each checkbox would remove) and
+`missing.per_month` (a small series the frontend can chart next to the date
+pickers — this is the "show missing rate" ask, so the user can see old,
+low-quality months before picking a train start).
 
-### Site lookup
-- `GET /api/sites?provider=PEA|MEA` — all Site_IDs (for a search/autocomplete
-  box).
-- `GET /api/site/{site_id}/trend?metric=kwh|bill_amount&start_month=&end_month=`
-  — a single site's monthly series, optionally windowed by `YYYYMM` bounds.
-  Feed this straight into a line chart.
+**POST /api/ml/build**
+```json
+{
+  "drop_options": {"duplicate_site": true, "shutdown_site": true, "maintenance_site": true},
+  "train_start": 202301, "train_end": 202512,
+  "test_start": 202601, "test_end": 202612,
+  "q_low": 0.05, "q_mid": 0.5, "q_high": 0.95
+}
+```
+Fits 3 quantile models on `train`, evaluates the band on `test`, and stores
+the result in `ML_STATE` for the later `/abnormal`, `/classify`, `/examples`,
+`/plots/download` calls. Returns coverage (should sit near `q_high - q_low`,
+e.g. ~90% for 0.05/0.95) and the flagged rate — the frontend's "did this run
+well" readout before the user moves to Result.
 
-## Why these particular EDA metrics
+**GET /api/ml/abnormal** → `{"count": N, "rows": [{site_id, anom_month, kwh, q05, q50, q95, quantile_severity}, ...]}`
 
-The brief asked "is this enough, and would a business person be able to hand
-this to the vendor?" A few additions beyond the original list, and why:
+### Result
 
-- **`error_rates`** — the four sanity ratios (zero-bill rate, bill-without-kWh,
-  kWh-without-bill, missing-kWh) are the numbers a business user would
-  actually quote back to a billing vendor as "X% of your invoices don't
-  reconcile with metered usage." Without them the EDA tab shows *lists* of
-  problems but no headline severity number.
-- **`load_reports`** in `error_rates` — every row silently dropped during
-  cleaning (ghost rows, MSC/RMSC exclusions, ambiguous site-type rows) is
-  logged with a plain-English reason. This is what turns "the dashboard
-  disagrees with the raw file" complaints into "here's exactly why, row by
-  row."
-- **Cross-provider common sites** (PEA∩MEA) — not in the original list, but
-  a physical site billed twice, once by each authority, is exactly the kind
-  of double-charge a business owner would want to catch.
-- Duplicates are split into **malformed IDs** vs **true duplicate rows**,
-  since they need different fixes: a malformed ID is a typo to correct at
-  the source; a true duplicate is a merge decision (`keep='first'`) that
-  silently drops billing history for the other row(s) — worth a human
-  reviewing before the merge in case the dropped row wasn't actually a
-  duplicate.
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/ml/classify` | user-input UP/DOWN/SUSTAIN → type counts + surfaced (spike_up/step_up) rows |
+| GET | `/api/ml/examples?anom_type=spike_up&limit=5` | up to 5 base64 PNGs |
+| GET | `/api/ml/plots/download?types=spike_up,step_up` | zip of every plot for the requested types |
 
-## Deploying
+**POST /api/ml/classify**
+```json
+{"up": 1.5, "down": 0.667, "sustain": 1.3}
+```
+Cheap — reuses the already-built model's flagged rows and the site's full
+kWh history captured at build time, so the user can retune these 3 numbers
+as many times as they like without rebuilding.
 
-**Render (this API):**
-1. Push this folder to a GitHub repo.
-2. New Web Service on Render → connect the repo.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+**GET /api/ml/examples?anom_type=step_up&limit=5** → base64 PNGs the frontend
+can drop straight into `<img src="data:image/png;base64,...">`.
 
-**Note on state:** the API keeps the processed table in memory
-(`STATE["container"]` in `main.py`). That's fine for a single small Render
-instance, but it resets on every redeploy/restart and won't work if you
-scale to multiple instances. For anything beyond a single-user internal
-tool, persist `container.master_df` (e.g. to S3 or a database) right after
-`build_master()` and reload it on startup instead of relying on the
-in-memory singleton.
+**GET /api/ml/plots/download** → binary zip response
+(`Content-Disposition: attachment`), structured `{type}/{site_id}.png`.
 
-**GitHub Pages (frontend):** point your static dashboard's fetch calls at
-the Render URL, e.g. `https://your-api.onrender.com/api/eda/summary`. CORS
-is currently wide open (`allow_origins=["*"]`) — tighten that to your Pages
-origin before going to production.
+## Design notes / assumptions made explicit
+
+- **Drop options are site-level, not row-level.** Once a Site_ID is flagged
+  duplicate/common/shutdown/maintenance, its *entire* history is removed
+  before feature-building — a half-clean series produces broken lag/rolling
+  features and a misleading band. If you'd rather drop only the offending
+  months, that's a one-line change in `site_filters.apply_drop_options`.
+- **Train/test are explicit date ranges you choose**, not the notebook's 80/20
+  chronological split — matches "select train range and test range" in the
+  spec. The two windows are not required to be non-overlapping; validate that
+  in the frontend if you want to enforce it.
+- **Classification thresholds are separate from the build step** by design —
+  section "Result step 2" says the user inputs UP/DOWN/SUSTAIN, so
+  `/api/ml/classify` never touches the fitted models, only re-labels the
+  already-flagged rows.
+- **Only spike_up/step_up are surfaced** in `/classify`'s `rows`,
+  `/examples`, and `/plots/download` (`step_down`/`spike_down`/`other` are
+  still computed internally for correctness, just not returned), per "just 2
+  types we concern about."

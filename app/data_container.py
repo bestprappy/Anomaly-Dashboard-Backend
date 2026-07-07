@@ -101,7 +101,6 @@ def _fix_numeric_col(col) -> str:
     except Exception:
         return str(col)
 
-
 def _normalise_mea_site_type(val) -> str:
     v = str(val).strip().upper()
     if v in ('0', 'NAN', ''):
@@ -149,16 +148,12 @@ class DataBillContainer:
     REQUIRED_FILES = ["pea_bfkt", "pea_tuc", "mea_bfkt", "mea_tuc", "mea_tmv"]
 
     def __init__(self):
-        # Per-file melted (long) frames — compact numeric dtypes. The wide raw
-        # frames are discarded right after melting to keep RAM low on small
-        # instances (Render free tier = 512MB).
         self.long_frames: dict[str, pd.DataFrame] = {}
-        # Tiny Site_ID/company/provider slices kept for the duplicate /
-        # common-site EDA, which needs pre-melt row granularity.
         self.site_frames: dict[str, pd.DataFrame] = {}
         self.load_reports: dict[str, LoadReport] = {}
         self.master_df: Optional[pd.DataFrame] = None
         self._loaded_keys: set[str] = set()
+        self.dropped_latest_month: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -413,14 +408,36 @@ class DataBillContainer:
     # Build the combined long master table
     # ------------------------------------------------------------------
 
+    def _drop_incomplete_latest_month(self, master: pd.DataFrame) -> pd.DataFrame:
+        """
+        The most recent calendar month in a fresh export is almost always
+        mid-billing-cycle: most sites haven't been billed yet, so kwh/bill_amount
+        reads as artificially low or zero. That month isn't "real" data yet, so
+        we drop it here — once, at the source — rather than let every EDA tab
+        and the ML pipeline separately have to work around a half-finished month.
+        """
+        if master.empty:
+            self.dropped_latest_month = None
+            return master
+
+        latest_month = int(master['month'].max())
+        before = len(master)
+        trimmed = master[master['month'] < latest_month].copy()
+        dropped_rows = before - len(trimmed)
+
+        self.dropped_latest_month = latest_month
+        logger.info(
+            f"Dropped {dropped_rows} rows from incomplete latest month {latest_month} "
+            f"(billing cycle likely still open)."
+        )
+        return trimmed
+
+
     def build_master(self) -> pd.DataFrame:
-        """Stack the per-file long frames (melted at load time) into one table."""
         if not self.long_frames:
             self.master_df = pd.DataFrame()
             return self.master_df
 
-        # Free the previous master before building the new one so both never
-        # coexist in RAM.
         self.master_df = None
         gc.collect()
 
@@ -429,6 +446,8 @@ class DataBillContainer:
         master['bill_class'] = master['bill_amount'].apply(classify_bill)
         master['date'] = pd.to_datetime(master['month'].astype(int).astype(str), format='%Y%m')
         master = master.sort_values(['provider', 'company', 'Site_ID', 'date']).reset_index(drop=True)
+
+        master = self._drop_incomplete_latest_month(master)
 
         self.master_df = master
         gc.collect()
