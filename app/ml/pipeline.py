@@ -13,8 +13,16 @@ Orchestrates the two Process/Result actions the ML tab needs:
                          ever refitting the model.
 
 Both read/write a single MLRunState instance so the router stays thin.
+
+Memory notes (512 MB instance): the master table is never copied whole —
+only the 3-4 columns the pipeline needs are materialised; intermediates are
+freed as soon as the next stage has consumed them; and the state keeps only
+the flagged rows plus the history of the flagged sites, not the full test
+set or the full site history.
 """
 from __future__ import annotations
+
+import gc
 
 import pandas as pd
 
@@ -35,8 +43,14 @@ def preview_missing_rate(
     how much missing data is left in the candidate date window — so the user
     can adjust either before committing to a build.
     """
-    filtered, drop_report = apply_drop_options(container.master_df, container, options)
+    # ensure_master(): the master table builds lazily on first access, and
+    # the ML tab may well be the first thing a user opens
+    filtered, drop_report = apply_drop_options(
+        container.ensure_master(), container, options, columns=["Site_ID", "month", "kwh"]
+    )
     missing = range_missing_summary(filtered, start_month, end_month)
+    del filtered
+    gc.collect()
     return {"drop_report": drop_report, "missing": missing}
 
 
@@ -52,18 +66,25 @@ def build_pipeline(
     qcfg: QuantileConfig,
     state: MLRunState,
 ) -> dict:
-    filtered, drop_report = apply_drop_options(container.master_df, container, options)
+    filtered, drop_report = apply_drop_options(
+        container.ensure_master(), container, options, columns=["Site_ID", "date", "kwh", "month"]
+    )
+
+    window_mask = (filtered["month"] >= train_range.start_month) & (
+        filtered["month"] <= test_range.end_month
+    )
+    featured = build_model_frame(filtered.loc[window_mask, ["Site_ID", "date", "kwh"]])
 
     # Kept unfiltered-by-window so the classify step can look at months
     # outside the train/test span (e.g. the 4 months before the earliest
-    # test-set anomaly).
-    full_history = filtered[["Site_ID", "date", "kwh"]].copy()
+    # test-set anomaly). Trimmed to just the flagged sites further down.
+    full_history = filtered[["Site_ID", "date", "kwh"]]
+    del filtered, window_mask
+    gc.collect()
 
-    window = filtered[
-        (filtered["month"] >= train_range.start_month) & (filtered["month"] <= test_range.end_month)
-    ]
-    featured = build_model_frame(window[["Site_ID", "date", "kwh"]])
     ready = select_model_ready(featured)
+    del featured
+    gc.collect()
 
     if ready.empty:
         raise ValueError(
@@ -80,24 +101,38 @@ def build_pipeline(
     if test.empty:
         raise ValueError("Test range has no model-ready rows — pick a wider test range.")
 
+    n_model_ready_rows = int(len(ready))
+    n_train_rows = int(len(train))
+    n_test_rows = int(len(test))
+
     result = run_quantile_stage(train, test, qcfg)
+    del train, test, ready, ready_month
+    gc.collect()
+
+    flagged = result["flagged"]
+
+    # Only the flagged sites' series are ever read again (classification and
+    # plotting both filter to them), so drop everyone else's history.
+    flagged_sites = set(flagged["site_id"].unique())
+    full_history = full_history[full_history["Site_ID"].isin(flagged_sites)].copy()
 
     state.drop_report = drop_report
     state.train_range = (train_range.start_month, train_range.end_month)
     state.test_range = (test_range.start_month, test_range.end_month)
     state.metrics = result["metrics"]
-    state.test_flagged = result["test"]
+    state.test_flagged = flagged
     state.full_history = full_history
     state.classified = None  # invalidate any previous classification from an older model
+    gc.collect()
 
     return {
         "drop_report": drop_report,
         "train_range": state.train_range,
         "test_range": state.test_range,
         "metrics": result["metrics"],
-        "n_model_ready_rows": int(len(ready)),
-        "n_train_rows": int(len(train)),
-        "n_test_rows": int(len(test)),
+        "n_model_ready_rows": n_model_ready_rows,
+        "n_train_rows": n_train_rows,
+        "n_test_rows": n_test_rows,
     }
 
 

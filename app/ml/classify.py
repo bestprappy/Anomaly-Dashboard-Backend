@@ -59,9 +59,9 @@ def classify_one(series: pd.Series | None, month, thresholds: ClassifyThresholds
 def classify_anomalies(
     test_flagged: pd.DataFrame, full_df: pd.DataFrame, thresholds: ClassifyThresholds, target_col: str
 ) -> pd.DataFrame:
-    """`test_flagged` = full test-set output of run_quantile_stage (has
-    flag_quantile column). Adds anom_m (Period, the actual unusual month),
-    anom_val, anom_type to the flagged subset only.
+    """`test_flagged` = flagged-rows output of run_quantile_stage (slim
+    columns, flag_quantile all True). Adds anom_m (Period, the actual
+    unusual month), anom_val, anom_type to the flagged subset only.
     """
     flag = test_flagged[test_flagged["flag_quantile"]].copy()
     if flag.empty:

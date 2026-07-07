@@ -21,8 +21,8 @@ class MLRunState:
     train_range: Optional[tuple[int, int]] = None
     test_range: Optional[tuple[int, int]] = None
     metrics: Optional[dict] = None
-    test_flagged: Optional[pd.DataFrame] = None    # every test row, incl. flag_quantile
-    full_history: Optional[pd.DataFrame] = None    # unfiltered per-site series, for classification/plots
+    test_flagged: Optional[pd.DataFrame] = None    # flagged test rows only (slim cols, flag_quantile all True)
+    full_history: Optional[pd.DataFrame] = None    # per-site series of the *flagged* sites, for classification/plots
     classified: Optional[pd.DataFrame] = None      # set once /classify is called; cleared on rebuild
     thresholds: ClassifyThresholds = field(default_factory=ClassifyThresholds)
 
