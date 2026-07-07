@@ -31,6 +31,18 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
+      - name: Trigger Render deploy
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL secret is not configured."
+            exit 1
+          fi
+
+          curl --fail --show-error --silent --request POST "$RENDER_DEPLOY_HOOK_URL"
+          echo "Render deploy hook triggered."
+
       - name: Notify deployment
         run: |
           echo "✅ Tests passed. Render will auto-deploy the changes."

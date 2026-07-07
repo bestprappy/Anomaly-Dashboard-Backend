@@ -3,6 +3,7 @@
 Run with: pytest tests/
 """
 import io
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -52,6 +53,35 @@ def upload_all(client: TestClient):
         "mea_tmv": ("mea_tmv.csv", io.BytesIO(mea_csv("MTM")), "text/csv"),
     }
     return client.post("/api/upload", files=files)
+
+
+def upload_chunked_file(
+    client: TestClient,
+    *,
+    file_key: str,
+    file_id: str,
+    data: bytes,
+    chunk_size: int = 40,
+):
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+
+    for i, chunk in enumerate(chunks):
+        resp = client.post(
+            "/api/upload/chunk",
+            params={
+                "file_id": file_id,
+                "chunk_number": i,
+                "total_chunks": len(chunks),
+                "file_key": file_key,
+                "file_name": f"{file_key}.csv",
+                "file_size": len(data),
+                "chunk_size": chunk_size,
+            },
+            files={"chunk": ("blob", io.BytesIO(chunk), "application/octet-stream")},
+        )
+        assert resp.status_code == 200, resp.text
+
+    return chunks
 
 
 def test_health_and_root(client):
@@ -108,32 +138,92 @@ def test_sites_and_trends(client):
 def test_chunked_upload_and_finalize(client):
     """Split a synthetic PEA file into chunks, upload them, finalize, verify."""
     data = pea_csv("CBR")
-    chunk_size = 40  # tiny chunks so the small fixture still needs several
-    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
     file_id = "pea_bfkt-1234567890-abc123"
 
-    for i, chunk in enumerate(chunks):
-        resp = client.post(
-            "/api/upload/chunk",
-            params={
-                "file_id": file_id,
-                "chunk_number": i,
-                "total_chunks": len(chunks),
-                "file_key": "pea_bfkt",
-            },
-            files={"chunk": ("blob", io.BytesIO(chunk), "application/octet-stream")},
-        )
-        assert resp.status_code == 200, resp.text
+    upload_chunked_file(client, file_key="pea_bfkt", file_id=file_id, data=data)
 
     resp = client.post("/api/upload/finalize", params={"file_id": file_id})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "pea_bfkt" in body["loaded_files"]
     assert body["rows_total"] > 0
+    assert body["ready"] is False
+    assert "pea_tuc" in body["missing_files"]
 
-    # the assembled data must parse identically to a direct upload
-    sites = client.get("/api/sites").json()["site_ids"]
-    assert "CBR4017" in sites
+    # The assembled data parsed successfully, but dashboard endpoints stay
+    # gated until all required billing files are loaded.
+    assert client.get("/api/sites").status_code == 409
+
+
+def test_chunk_upload_rejects_bad_sequence_and_metadata(client):
+    data = pea_csv("CBR")
+    chunk = data[:40]
+
+    resp = client.post(
+        "/api/upload/chunk",
+        params={
+            "file_id": "bad-sequence-1",
+            "chunk_number": 1,
+            "total_chunks": 1,
+            "file_key": "pea_bfkt",
+        },
+        files={"chunk": ("blob", io.BytesIO(chunk), "application/octet-stream")},
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/api/upload/chunk",
+        params={
+            "file_id": "metadata-mismatch-1",
+            "chunk_number": 0,
+            "total_chunks": 3,
+            "file_key": "pea_bfkt",
+            "file_size": len(data),
+            "chunk_size": 40,
+        },
+        files={"chunk": ("blob", io.BytesIO(chunk), "application/octet-stream")},
+    )
+    assert resp.status_code == 200
+
+    resp = client.post(
+        "/api/upload/chunk",
+        params={
+            "file_id": "metadata-mismatch-1",
+            "chunk_number": 1,
+            "total_chunks": 4,
+            "file_key": "pea_bfkt",
+            "file_size": len(data),
+            "chunk_size": 40,
+        },
+        files={"chunk": ("blob", io.BytesIO(data[40:80]), "application/octet-stream")},
+    )
+    assert resp.status_code == 409
+
+
+def test_concurrent_chunk_finalization_is_serialized(client):
+    upload_chunked_file(
+        client,
+        file_key="pea_bfkt",
+        file_id="pea-bfkt-concurrent",
+        data=pea_csv("CBR"),
+    )
+    upload_chunked_file(
+        client,
+        file_key="pea_tuc",
+        file_id="pea-tuc-concurrent",
+        data=pea_csv("TUC"),
+    )
+
+    def finalize(file_id: str):
+        return client.post("/api/upload/finalize", params={"file_id": file_id})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(finalize, ["pea-bfkt-concurrent", "pea-tuc-concurrent"]))
+
+    assert all(resp.status_code == 200 for resp in responses)
+    status = client.get("/api/upload/status").json()
+    assert {"pea_bfkt", "pea_tuc"}.issubset(set(status["loaded_files"]))
+    assert status["ready"] is False
 
 
 def test_finalize_rejects_missing_chunks_and_bad_ids(client):

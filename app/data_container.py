@@ -177,7 +177,11 @@ class DataBillContainer:
             t0=time.time(); self._load_mea("TMV", files["mea_tmv"]); logger.info(f"mea_tmv load={time.time()-t0:.1f}s")
 
     def is_ready(self) -> bool:
-        return self.master_df is not None and len(self.master_df) > 0
+        return (
+            self.master_df is not None
+            and len(self.master_df) > 0
+            and not self.missing_files()
+        )
 
     def loaded_files(self) -> list[str]:
         return sorted(self._loaded_keys)
