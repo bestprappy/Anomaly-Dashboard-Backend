@@ -13,10 +13,20 @@ from __future__ import annotations
 import io
 import zipfile
 
-import matplotlib
-matplotlib.use("Agg")  # headless server, never touches a display
-import matplotlib.pyplot as plt
 import pandas as pd
+
+
+def _get_pyplot():
+    """Import matplotlib lazily: it costs ~40+ MB of RSS, and on the 512 MB
+    instance the upload/EDA endpoints must never pay for it. Only the two
+    plot endpoints trigger this.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless server, never touches a display
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def yyyymm_to_period(month: int) -> pd.Period:
@@ -54,6 +64,7 @@ def render_site_plot(
     series = _slice_series(series, start_period, end_period)
     anomalies = _slice_anomalies(anomalies, start_period, end_period)
 
+    plt = _get_pyplot()
     fig, ax = plt.subplots(figsize=(8, 3))
     x = series.index.to_timestamp()
     ax.plot(x, series.values, "-o", ms=3, lw=1.5, color="steelblue")

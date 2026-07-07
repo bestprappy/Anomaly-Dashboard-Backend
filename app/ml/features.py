@@ -32,8 +32,10 @@ def build_model_frame(df: pd.DataFrame) -> pd.DataFrame:
     d["year"] = d["bill_month"].dt.year
     d["month"] = d["bill_month"].dt.month
     d["quarter"] = d["bill_month"].dt.quarter
-    d["month_sin"] = np.sin(2 * np.pi * d["month"] / 12)
-    d["month_cos"] = np.cos(2 * np.pi * d["month"] / 12)
+    # float32 keeps the engineered frame half the size; the model bins to
+    # uint8 internally anyway so precision is irrelevant
+    d["month_sin"] = np.sin(2 * np.pi * d["month"] / 12).astype(np.float32)
+    d["month_cos"] = np.cos(2 * np.pi * d["month"] / 12).astype(np.float32)
     d[TARGET_COL] = d.groupby("site_id")["kwh"].shift(-1)
     for lag in (1, 2, 3, 6):
         d[f"kwh_lag_{lag}"] = d.groupby("site_id")["kwh"].shift(lag)
@@ -41,7 +43,7 @@ def build_model_frame(df: pd.DataFrame) -> pd.DataFrame:
     d["kwh_roll_3_mean"] = g.transform(lambda x: x.shift(1).rolling(3).mean())
     d["kwh_roll_6_mean"] = g.transform(lambda x: x.shift(1).rolling(6).mean())
     d["kwh_roll_3_std"] = g.transform(lambda x: x.shift(1).rolling(3).std())
-    d["province_freq"] = d["province"].map(d["province"].value_counts(normalize=True))
+    d["province_freq"] = d["province"].map(d["province"].value_counts(normalize=True)).astype(np.float32)
     d["site_month_no"] = d.groupby("site_id").cumcount()
     return d
 

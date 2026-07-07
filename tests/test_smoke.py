@@ -3,6 +3,7 @@
 Run with: pytest tests/
 """
 import io
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -205,6 +206,11 @@ def test_chunk_upload_rejects_bad_sequence_and_metadata(client):
     assert resp.status_code == 409
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Hangs on Windows (TestClient + ThreadPoolExecutor deadlock, pre-existing); "
+           "covered by the Linux CI run.",
+)
 def test_concurrent_chunk_finalization_is_serialized(client):
     upload_chunked_file(
         client,
@@ -260,6 +266,100 @@ def test_finalize_rejects_missing_chunks_and_bad_ids(client):
         files={"chunk": ("blob", io.BytesIO(b"abc"), "application/octet-stream")},
     )
     assert resp.status_code == 422
+
+
+def pea_csv_ml(site_prefix: str, n_sites: int = 8, spike_site_idx: int = 0) -> bytes:
+    """12 BE months (256901..256912 -> 202601..202612) of non-zero usage so
+    sites clear the >=7-consecutive-clean-months bar the ML pipeline needs.
+    Site `spike_site_idx` gets a 10x kWh jump in 202610 (a test-window
+    target month) so the quantile band reliably flags at least one anomaly.
+    """
+    months = [f"2569{m:02d}" for m in range(1, 13)]
+    n_cols = 3 + 1 + len(months) + 1 + len(months)
+    banner = ",".join(f"h{i}" for i in range(1, n_cols + 1))
+    header = "Site_ID,Meter_No.,Province,avg," + ",".join(months) + ",avg," + ",".join(months)
+    lines = [banner, header]
+    for i in range(n_sites):
+        base = 50 + 10 * i
+        units = [base + (m % 3) for m in range(1, 13)]
+        if i == spike_site_idx:
+            units[9] = base * 10  # BE 256910 -> 202610
+        amounts = [u * 4 for u in units]
+        row = [f"{site_prefix}5{i:03d}", str(500 + i), "BKK", ""]
+        row += [str(a) for a in amounts]
+        row += [""]
+        row += [str(u) for u in units]
+        lines.append(",".join(row))
+    return "\n".join(lines).encode()
+
+
+def upload_all_ml(client: TestClient):
+    files = {
+        "pea_bfkt": ("pea_bfkt.csv", io.BytesIO(pea_csv_ml("CBR")), "text/csv"),
+        "pea_tuc": ("pea_tuc.csv", io.BytesIO(pea_csv_ml("TUC")), "text/csv"),
+        "mea_bfkt": ("mea_bfkt.csv", io.BytesIO(mea_csv("MBF")), "text/csv"),
+        "mea_tuc": ("mea_tuc.csv", io.BytesIO(mea_csv("MTU")), "text/csv"),
+        "mea_tmv": ("mea_tmv.csv", io.BytesIO(mea_csv("MTM")), "text/csv"),
+    }
+    return client.post("/api/upload", files=files)
+
+
+def test_ml_pipeline_end_to_end(client):
+    up = upload_all_ml(client)
+    assert up.status_code == 200, up.text
+    assert up.json()["ready"] is True
+
+    opts = client.get("/api/ml/drop-options").json()["options"]
+    assert {o["value"] for o in opts} == {
+        "duplicate_site", "common_site", "shutdown_site", "maintenance_site"}
+
+    # ML endpoints that need a model must 409 before any build
+    assert client.get("/api/ml/abnormal").status_code == 409
+    assert client.post("/api/ml/classify", json={}).status_code == 409
+    assert client.get("/api/ml/examples", params={"anom_type": "spike_up"}).status_code == 409
+
+    resp = client.post("/api/ml/preview", json={
+        "drop_options": {}, "start_month": 202601, "end_month": 202611})
+    assert resp.status_code == 200, resp.text
+    prev = resp.json()
+    assert prev["missing"]["n_months"] > 0
+    assert prev["drop_report"]["sites_remaining"] > 0
+
+    resp = client.post("/api/ml/build", json={
+        "drop_options": {},
+        "train_start": 202601, "train_end": 202608,
+        "test_start": 202609, "test_end": 202610,
+    })
+    assert resp.status_code == 200, resp.text
+    build = resp.json()
+    assert build["n_train_rows"] > 0 and build["n_test_rows"] > 0
+    assert 0.0 <= build["metrics"]["train"]["coverage"] <= 1.0
+    assert build["metrics"]["n_flagged_test"] >= 1  # the 10x spike must escape the band
+
+    resp = client.get("/api/ml/abnormal")
+    assert resp.status_code == 200, resp.text
+    ab = resp.json()
+    assert ab["count"] == len(ab["rows"]) >= 1
+    for row in ab["rows"]:
+        assert set(row) >= {"site_id", "anom_month", "kwh",
+                            "q05", "q50", "q95", "quantile_severity"}
+
+    resp = client.post("/api/ml/classify", json={})
+    assert resp.status_code == 200, resp.text
+    cls = resp.json()
+    assert set(cls["surfaced_types"]) == {"spike_up", "step_up"}
+    for row in cls["rows"]:
+        assert set(row) >= {"site_id", "anom_month", "anom_val",
+                            "anom_type", "quantile_severity"}
+
+    resp = client.get("/api/ml/examples", params={"anom_type": "spike_up", "limit": 3})
+    assert resp.status_code == 200, resp.text
+    ex = resp.json()
+    assert ex["count"] == len(ex["images"])
+
+    resp = client.get("/api/ml/plots/download")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "application/zip"
 
 
 def test_bad_uploads_return_422_with_clear_message(client):

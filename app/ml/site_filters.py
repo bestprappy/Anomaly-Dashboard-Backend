@@ -66,22 +66,31 @@ def resolve_dropped_site_ids(container: DataBillContainer, options: DropOptions)
 
 
 def apply_drop_options(
-    master_df: pd.DataFrame, container: DataBillContainer, options: DropOptions
+    master_df: pd.DataFrame,
+    container: DataBillContainer,
+    options: DropOptions,
+    columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Filter master_df by the selected drop options.
 
     Returns (filtered_df, report). A site can match more than one option, so
     `total_sites_dropped` is the size of the union, not the sum of the
     per-option counts.
+
+    `columns` limits the output to just those columns. The master table's
+    string columns dominate its memory footprint, so on the 512 MB instance
+    callers must pass only what they actually read instead of copying the
+    full-width table.
     """
     dropped_by_option = resolve_dropped_site_ids(container, options)
     all_dropped: set[str] = set()
     for ids in dropped_by_option.values():
         all_dropped |= ids
 
+    base = master_df if columns is None else master_df[columns]
     filtered = (
-        master_df[~master_df["Site_ID"].isin(all_dropped)].copy()
-        if all_dropped else master_df.copy()
+        base[~master_df["Site_ID"].isin(all_dropped)].copy()
+        if all_dropped else base.copy()
     )
 
     report = {

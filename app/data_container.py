@@ -250,23 +250,44 @@ class DataBillContainer:
         amount_cols = [c for c in raw.columns if str(c).endswith('_amount') and c != 'avg_amount']
         unit_cols = [c for c in raw.columns if str(c).endswith('_unit') and c != 'avg_unit']
 
-        # drop rows whose most-recent 3 unit columns are all zero/NaN (deceased sites)
+        # Prune to just the columns the melt will use — the raw export carries
+        # banner/summary columns that would otherwise ride along through every
+        # copy below (the API lives on a 512 MB instance; prune early).
+        meta_keep = [c for c in ('Meter_No', MEA_METER_COL, 'Site_ID',
+                                  'RATE_CAT', 'Rate_CAT', 'TOU&TOD', 'Province',
+                                  *PEA_SITE_TYPE_COL_CANDIDATES) if c in raw.columns]
+        raw = raw[list(dict.fromkeys(meta_keep + amount_cols + unit_cols))]
+
+        # Convert the numeric block column-by-column into float32. The old
+        # whole-block `.apply(_clean_numeric_string)` briefly duplicated the
+        # entire numeric block as strings *and* left it float64 — both fatal
+        # at 512 MB. Collecting into a dict then concatenating once also
+        # avoids block-manager fragmentation.
+        converted = {}
+        for col in amount_cols + unit_cols:
+            s = raw[col]
+            if s.dtype == object:
+                s = pd.to_numeric(_clean_numeric_string(s), errors="coerce")
+            else:
+                s = pd.to_numeric(s, errors="coerce")
+            converted[col] = s.fillna(0.0).astype(np.float32)
+        raw = pd.concat(
+            [raw.drop(columns=amount_cols + unit_cols),
+             pd.DataFrame(converted, index=raw.index)],
+            axis=1,
+        )
+        del converted
+        gc.collect()
+
+        # drop rows whose most-recent 3 unit columns are all zero/NaN (deceased
+        # sites) — NaNs are already 0.0 after the conversion above
         recent_unit_cols = sorted(unit_cols, key=lambda c: int(c.split('_')[0]))[-3:]
         if recent_unit_cols:
-            mask_bad = raw[recent_unit_cols].apply(
-                lambda x: pd.to_numeric(x, errors='coerce').fillna(0) == 0
-            ).all(axis=1)
+            mask_bad = raw[recent_unit_cols].eq(0).all(axis=1)
             before = len(raw)
             raw = raw[~mask_bad].copy()
             report.notes.append(f"Dropped {before - len(raw)} rows with 0 usage "
                                  f"in last 3 known months ({recent_unit_cols}).")
-
-        raw[amount_cols + unit_cols] = (
-            raw[amount_cols + unit_cols]
-            .apply(_clean_numeric_string)
-            .apply(pd.to_numeric, errors="coerce")
-            .fillna(0.0)
-        )
 
         type_col = next((c for c in PEA_SITE_TYPE_COL_CANDIDATES if c in raw.columns), None)
         if type_col:
@@ -332,6 +353,26 @@ class DataBillContainer:
         report.notes.append(f"Dropped {before - len(raw)} MSC rows.")
 
         amt_cols, unit_cols = self._mea_month_columns(raw)
+
+        # Prune to the columns the melt keeps, then convert the monthly block
+        # to float32 column-by-column *before* melting (512 MB instance: the
+        # old post-melt to_numeric carried the whole block through the melt as
+        # objects). No fillna here — the ghost/dedupe steps below rely on NaN.
+        meta_keep = [c for c in (MEA_METER_COL, 'Site_ID', 'site_type', 'Rate_CAT',
+                                  'TOU&TOD', 'Province', 'Input_Date', 'Remark')
+                     if c in raw.columns]
+        raw = raw[list(dict.fromkeys(meta_keep + amt_cols + unit_cols))]
+
+        converted = {}
+        for col in amt_cols + unit_cols:
+            converted[col] = pd.to_numeric(raw[col], errors='coerce').astype(np.float32)
+        raw = pd.concat(
+            [raw.drop(columns=amt_cols + unit_cols),
+             pd.DataFrame(converted, index=raw.index)],
+            axis=1,
+        )
+        del converted
+        gc.collect()
 
         # drop ghost rows (every monthly amount is NaN) then dedupe by meter,
         # keeping the row with the most non-NaN months ("first" tie-break)
@@ -425,7 +466,9 @@ class DataBillContainer:
 
         latest_month = int(master['month'].max())
         before = len(master)
-        trimmed = master[master['month'] < latest_month].copy()
+        # boolean indexing already returns a new frame; an extra .copy() would
+        # briefly hold the master table in memory twice
+        trimmed = master[master['month'] < latest_month]
         dropped_rows = before - len(trimmed)
 
         self.dropped_latest_month = latest_month
@@ -473,27 +516,38 @@ class DataBillContainer:
         amount_cols = [c for c in raw.columns if str(c).endswith('_amount') and c != 'avg_amount']
         unit_cols = [c for c in raw.columns if str(c).endswith('_unit') and c != 'avg_unit']
 
-        amt_long = raw.melt(id_vars=id_cols, value_vars=amount_cols,
+        # Melt on a compact integer row key instead of the ~9 string id
+        # columns. Melting duplicates every id column per month, which made
+        # the two long frames the biggest transient allocation of the whole
+        # upload on the 512 MB instance; the metadata now joins back exactly
+        # once at the end.
+        raw = raw.copy()
+        raw['_row'] = np.arange(len(raw), dtype=np.int32)
+
+        amt_long = raw.melt(id_vars=['_row'], value_vars=amount_cols,
                              var_name='month_raw', value_name='bill_amount')
         amt_long['month_key'] = amt_long['month_raw'].str.replace('_amount', '', regex=False)
+        amt_long = amt_long.drop(columns=['month_raw'])
 
-        unit_long = raw.melt(id_vars=id_cols, value_vars=unit_cols,
+        unit_long = raw.melt(id_vars=['_row'], value_vars=unit_cols,
                               var_name='month_raw', value_name='kwh')
         unit_long['month_key'] = unit_long['month_raw'].str.replace('_unit', '', regex=False)
+        unit_long = unit_long.drop(columns=['month_raw'])
 
-        merged = amt_long.merge(
-            unit_long[id_cols + ['month_key', 'kwh']],
-            on=id_cols + ['month_key'], how='left'
-        )
-        merged = merged.drop(columns=['month_raw'])
+        merged = amt_long.merge(unit_long, on=['_row', 'month_key'], how='left')
+        del amt_long, unit_long
+        gc.collect()
 
         # month_key is Buddhist-era YYYYMM (e.g. 256902) -> convert to Gregorian.
         # Some exports already use Gregorian years, so only shift years >= 2400.
         year = merged['month_key'].str[:4].astype(int)
         mm = merged['month_key'].str[4:6].astype(int)
         year = np.where(year >= 2400, year - 543, year)
-        merged['month'] = year * 100 + mm
+        merged['month'] = (year * 100 + mm).astype(np.int32)
         merged = merged.drop(columns=['month_key'])
+
+        merged = merged.merge(raw[id_cols + ['_row']], on='_row', how='left')
+        merged = merged.drop(columns=['_row'])
 
         merged = merged.rename(columns={'RATE_CAT': 'Rate_CAT', 'TOU&TOD': 'TOU_TOD'})
         if 'TOU_TOD' not in merged.columns:
@@ -515,43 +569,57 @@ class DataBillContainer:
         amt_cols, unit_cols = self._mea_month_columns(raw)
         logger.info(f"[{raw['company'].iloc[0]}] amt_cols={len(amt_cols)} unit_cols={len(unit_cols)}")
         logger.info(f"[{raw['company'].iloc[0]}] sample amt_cols: {amt_cols[:5]}")
-        id_cols = [c for c in [MEA_METER_COL, 'Site_ID', 'company', 'provider', 'site_type',
-                                'Rate_CAT', 'TOU&TOD', 'Province', 'Input_Date', 'Remark']
-                   if c in raw.columns]
 
-        melted_amt = raw[id_cols + amt_cols].melt(
-            id_vars=id_cols, value_vars=amt_cols, var_name='month_raw', value_name='bill_amount')
-        melted_amt['month'] = melted_amt['month_raw'].astype(int)
+        # Melt on just (meter, company); the remaining metadata joins back
+        # exactly once at the end. Dragging every meta column through two
+        # melts, a merge and the spine used to multiply the string columns
+        # by the month count — the biggest transient of an MEA upload.
+        key_cols = [MEA_METER_COL, 'company']
+        meta_cols = [c for c in ['Site_ID', 'site_type', 'Rate_CAT', 'TOU&TOD',
+                                  'Province', 'Input_Date', 'Remark'] if c in raw.columns]
+
+        melted_amt = raw[key_cols + amt_cols].melt(
+            id_vars=key_cols, value_vars=amt_cols, var_name='month_raw', value_name='bill_amount')
+        melted_amt['month'] = melted_amt['month_raw'].astype(int).astype(np.int32)
         melted_amt = melted_amt.drop(columns=['month_raw'])
 
         if unit_cols:
-            melted_kwh = raw[id_cols + unit_cols].melt(
-                id_vars=id_cols, value_vars=unit_cols, var_name='month_raw', value_name='kwh')
-            melted_kwh['month'] = melted_kwh['month_raw'].apply(lambda c: int(str(c).strip()[:6]))
+            melted_kwh = raw[key_cols + unit_cols].melt(
+                id_vars=key_cols, value_vars=unit_cols, var_name='month_raw', value_name='kwh')
+            melted_kwh['month'] = melted_kwh['month_raw'].apply(
+                lambda c: int(str(c).strip()[:6])).astype(np.int32)
             melted_kwh = melted_kwh.drop(columns=['month_raw'])
-            merged = melted_amt.merge(melted_kwh, on=id_cols + ['month'], how='left')
+            merged = melted_amt.merge(melted_kwh, on=key_cols + ['month'], how='left')
+            del melted_kwh
         else:
             merged = melted_amt.copy()
-            merged['kwh'] = np.nan
+            merged['kwh'] = pd.Series(np.nan, index=merged.index, dtype='float32')
+        del melted_amt
+        gc.collect()
 
         merged[MEA_METER_COL] = merged[MEA_METER_COL].astype('int64').astype(str)
-        merged['bill_amount'] = pd.to_numeric(merged['bill_amount'], errors='coerce')
-        merged['kwh'] = pd.to_numeric(merged['kwh'], errors='coerce')
 
         # --- fill spine + shutdown detection (ported from MEA_cleaning.ipynb) ---
-        merged = merged.sort_values([MEA_METER_COL, 'company', 'month']).reset_index(drop=True)
+        merged = merged.sort_values(key_cols + ['month']).reset_index(drop=True)
 
         all_months = sorted(merged['month'].unique())
-        keys = merged[[MEA_METER_COL, 'company']].drop_duplicates()
+        keys = merged[key_cols].drop_duplicates()
         logger.info(f"[{raw['company'].iloc[0]}] unique_meters={len(keys)} unique_months={len(all_months)} "
                     f"spine_size={len(keys)*len(all_months)}")
-        spine = keys.merge(pd.DataFrame({'month': all_months}), how='cross')
-        merged = spine.merge(merged, on=[MEA_METER_COL, 'company', 'month'], how='left')
+        spine = keys.merge(
+            pd.DataFrame({'month': all_months}).astype({'month': 'int32'}), how='cross')
+        merged = spine.merge(merged, on=key_cols + ['month'], how='left')
+        del spine, keys
+        gc.collect()
 
-        meta_cols = [c for c in ['Site_ID', 'site_type', 'Rate_CAT', 'TOU&TOD',
-                                  'Province', 'Input_Date', 'Remark'] if c in merged.columns]
+        # raw is one row per meter after the dedupe in _load_mea, so a single
+        # per-meter merge fills the spine-created gap rows with the same
+        # values the old per-group ffill().bfill() produced.
         if meta_cols:
-            merged[meta_cols] = merged.groupby([MEA_METER_COL, 'company'])[meta_cols].ffill().bfill()
+            meta = raw[[MEA_METER_COL] + meta_cols].copy()
+            meta[MEA_METER_COL] = meta[MEA_METER_COL].astype('int64').astype(str)
+            merged = merged.merge(meta, on=MEA_METER_COL, how='left')
+            del meta
         merged['provider'] = 'MEA'
 
         merged['bill_amount'] = merged['bill_amount'].fillna(0).round(2)
