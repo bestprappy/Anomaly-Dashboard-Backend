@@ -230,7 +230,8 @@ def validate_chunk_size(
 
 def load_and_build(container: DataBillContainer, files: dict[str, object]) -> None:
     container.load_files(files)
-    container.build_master()
+    if not container.missing_files():
+        container.build_master()
 
 
 async def finalize_chunk_upload(file_id: str) -> UploadStatus:

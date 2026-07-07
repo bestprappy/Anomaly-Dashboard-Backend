@@ -146,7 +146,7 @@ def test_chunked_upload_and_finalize(client):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "pea_bfkt" in body["loaded_files"]
-    assert body["rows_total"] > 0
+    assert body["rows_total"] == 0
     assert body["ready"] is False
     assert "pea_tuc" in body["missing_files"]
 
