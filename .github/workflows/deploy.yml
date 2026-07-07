@@ -26,7 +26,31 @@ jobs:
         # python -m puts the repo root on sys.path so `app` is importable
         run: python -m pytest tests/ -v
 
-  deploy:
+  deploy-hf:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Space subdomain atonality123-test101.hf.space -> spaces/atonality123/test101
+          HF_SPACE: atonality123/test101
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN secret is not configured — skipping Hugging Face deploy."
+            echo "Add a write-scoped token at Settings > Secrets to enable auto-deploy."
+            exit 0
+          fi
+
+          git push --force "https://oauth2:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" HEAD:main
+          echo "✅ Pushed to Hugging Face Space ${HF_SPACE}; it will rebuild automatically."
+
+  deploy-render:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
@@ -36,14 +60,9 @@ jobs:
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
           if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
-            echo "RENDER_DEPLOY_HOOK_URL secret is not configured."
-            exit 1
+            echo "RENDER_DEPLOY_HOOK_URL secret is not configured — skipping Render deploy."
+            exit 0
           fi
 
           curl --fail --show-error --silent --request POST "$RENDER_DEPLOY_HOOK_URL"
           echo "Render deploy hook triggered."
-
-      - name: Notify deployment
-        run: |
-          echo "✅ Tests passed. Render will auto-deploy the changes."
-          echo "Push was successful. Check Render dashboard for deployment status."
