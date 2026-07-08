@@ -46,6 +46,7 @@ from app.ml.pipeline import abnormal_dataframe, build_pipeline, classify_pipelin
 from app.ml.plotting import render_all_zip, render_examples, yyyymm_to_period
 from app.ml.schemas import BuildRequest, ClassifyRequest, PreviewRequest
 from app.ml.state import ML_STATE
+from app.ml.impact import monthly_impact_summary, residual_impact
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ml", tags=["ml"])
@@ -223,3 +224,34 @@ def download_plots(
         media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=anomaly_plots.zip"},
     )
+
+@router.get("/impact")
+def impact():
+    """Total excess kWh + estimated baht cost of flagged spike_up anomalies
+    (step_up is excluded — see impact.py docstring), broken down by provider
+    (PEA/MEA) and by calendar month across the test range. Each site's own
+    average baht/kWh (derived from its clean billing history) is used to
+    price its excess — not a flat rate, since PEA/MEA and rate-category
+    tariffs differ.
+    """
+    _require_classified()
+    container = _get_ready_container()
+    flag = ML_STATE.classified
+    if flag.empty:
+        return {"summary_by_provider": [], "summary_by_month": [], "unpriced_row_count": 0, "rows": []}
+ 
+    detail, summary = residual_impact(flag, container.master_df)
+    monthly = monthly_impact_summary(detail)
+    unpriced = int(detail["avg_price_per_kwh"].isna().sum()) if not detail.empty else 0
+ 
+    rows = []
+    if not detail.empty:
+        rows = detail[
+            ["site_id", "provider", "company", "anom_type", "anom_val", "q50",
+             "excess_kwh", "avg_price_per_kwh", "estimated_excess_baht"]
+        ].sort_values("estimated_excess_baht", ascending=False).to_dict(orient="records")
+ 
+    return {
+        "summary_by_provider": summary.to_dict(orient="records"),
+        "summary_by_month": monthly.to_dict(orient="records"),
+    }

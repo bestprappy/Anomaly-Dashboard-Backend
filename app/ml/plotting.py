@@ -99,7 +99,10 @@ def render_examples(
         series = series_map.get(sid)
         if series is None:
             continue
-        anoms = flag[flag["site_id"] == sid]
+        # Only mark THIS type's anomalies — a site can have other flagged
+        # months (e.g. "other") that shouldn't show up red on a spike_up
+        # or step_up example plot.
+        anoms = flag[(flag["site_id"] == sid) & (flag["anom_type"] == anom_type)]
         out[sid] = render_site_plot(sid, series, anoms, anom_type, start_period, end_period)
     return out
 
@@ -123,7 +126,7 @@ def render_all_zip(
                 series = series_map.get(sid)
                 if series is None:
                     continue
-                anoms = flag[flag["site_id"] == sid]
+                anoms = flag[(flag["site_id"] == sid) & (flag["anom_type"] == t)]
                 png = render_site_plot(sid, series, anoms, t, start_period, end_period)
                 zf.writestr(f"{t}/{sid}.png", png)
     return buf.getvalue()

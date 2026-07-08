@@ -8,15 +8,16 @@ look at the site's full monthly series around that month and compare the
   step_up    value jumps and *stays* high  -> sustained level shift (e.g. a
              merge/consolidation of load onto one site)
   spike_up   a one-month jump that reverts -> transient
-  step_down / spike_down   same, downward
-  other      doesn't clear the jump threshold either way
+  other      doesn't clear the jump threshold
   unknown    site has no usable history around that month
 
-Only spike_up / step_up are surfaced to the frontend (that's the whole
-product ask), but all four/five buckets are computed so "other" keeps its
-meaning and a real downward jump never gets silently folded into "unknown".
+Only over-band values reach this stage at all (see quantile_model.py's
+flag_and_slim, which only flags y > q_high), so there's no downward case to
+classify here — a genuine drop would never have been flagged in the first
+place. If that upstream filter ever changes to flag both tails again, the
+down-side branch would need to come back here too.
 
-Thresholds (up/down/sustain) are user input from the Result tab and are
+Thresholds (up/sustain) are user input from the Result tab and are
 re-appliable to an already-built model without refitting anything.
 """
 from __future__ import annotations
@@ -27,7 +28,7 @@ import pandas as pd
 from app.ml.config import ClassifyThresholds
 
 SURFACED_TYPES = ("spike_up", "step_up")
-ALL_TYPES = ("step_up", "spike_up", "step_down", "spike_down", "other", "unknown")
+ALL_TYPES = ("step_up", "spike_up", "other", "unknown")
 
 
 def build_site_series(full_df: pd.DataFrame, site_ids: set[str]) -> dict[str, pd.Series]:
@@ -51,8 +52,6 @@ def classify_one(series: pd.Series | None, month, thresholds: ClassifyThresholds
         return "unknown"
     if v >= thresholds.up * before:
         return "step_up" if (np.isfinite(after) and after >= thresholds.sustain * before) else "spike_up"
-    if v <= thresholds.down * before:
-        return "step_down" if (np.isfinite(after) and after <= before / thresholds.sustain) else "spike_down"
     return "other"
 
 
@@ -60,8 +59,8 @@ def classify_anomalies(
     test_flagged: pd.DataFrame, full_df: pd.DataFrame, thresholds: ClassifyThresholds, target_col: str
 ) -> pd.DataFrame:
     """`test_flagged` = flagged-rows output of run_quantile_stage (slim
-    columns, flag_quantile all True). Adds anom_m (Period, the actual
-    unusual month), anom_val, anom_type to the flagged subset only.
+    columns, flag_quantile all True, all over-band). Adds anom_m (Period,
+    the actual unusual month), anom_val, anom_type to the flagged subset.
     """
     flag = test_flagged[test_flagged["flag_quantile"]].copy()
     if flag.empty:

@@ -1,10 +1,12 @@
 """
 Stage 1 of the pipeline: quantile-regression prediction band.
 
-Anomaly flag = actual next-month kWh falls outside [q_low, q_high].
-Isolation Forest severity is intentionally not implemented — `quantile_severity`
-(how many band-widths outside the band a point falls) is the only ranking
-signal the product needs.
+Anomaly flag = actual next-month kWh exceeds the predicted q_high. Only the
+upper tail is flagged (this pipeline concerns itself with spike_up/step_up
+only) — a value coming in low, including a sharp reversion right after a
+spike, is not something we classify here. Isolation Forest severity is
+intentionally not implemented — `quantile_severity` (how many band-widths
+over q_high a point falls) is the only ranking signal the product needs.
 
 Memory notes (the API lives on a 512 MB instance):
   - sklearn is imported lazily inside the fit function so the upload/EDA
@@ -60,17 +62,18 @@ def pinball_p50(y: pd.Series, band: pd.DataFrame) -> float:
 
 
 def flag_and_slim(part: pd.DataFrame, band: pd.DataFrame, target_col: str = TARGET_COL) -> tuple[pd.DataFrame, int]:
-    """Flag band-escapes and return (flagged-rows-only slim frame, n_flagged).
+    """Flag upper-band escapes only (y > q_high) and return (flagged-rows-only
+    slim frame, n_flagged).
 
-    Column names q05/q50/q95 are kept for backward compatibility with the
-    /abnormal contract even though the quantiles are configurable.
+    Only over-band values are flagged — this pipeline concerns itself with
+    spike_up/step_up, so a value coming in *under* q_low (including a sharp
+    reversion right after a spike) is not an anomaly we care about here.
     """
     y = part[target_col]
     band_width = (band["q_high"] - band["q_low"]).clip(lower=1e-9)
-    flag_mask = (y < band["q_low"]) | (y > band["q_high"])
+    flag_mask = y > band["q_high"]
     over = (y - band["q_high"]).clip(lower=0)
-    under = (band["q_low"] - y).clip(lower=0)
-    severity = ((over + under) / band_width).round(3)
+    severity = (over / band_width).round(3)
 
     flagged = part.loc[flag_mask, FLAGGED_KEEP_COLS].copy()
     flagged["q05"] = band.loc[flag_mask, "q_low"]
