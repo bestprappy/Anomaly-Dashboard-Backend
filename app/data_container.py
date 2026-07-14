@@ -30,6 +30,7 @@ Master table schema (self.master_df), one row per site per month:
 
 from __future__ import annotations
 
+import csv
 import gc
 import io
 import re
@@ -165,6 +166,8 @@ class DataBillContainer:
         self.master_df: Optional[pd.DataFrame] = None
         self._loaded_keys: set[str] = set()
         self.dropped_latest_month: Optional[int] = None
+        # most-recent eda_meter_patterns result, keyed by window; cleared on rebuild
+        self._meter_patterns_cache: dict[int, dict] = {}
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -491,6 +494,7 @@ class DataBillContainer:
 
 
     def build_master(self) -> pd.DataFrame:
+        self._meter_patterns_cache = {}
         if not self.long_frames:
             self.master_df = pd.DataFrame()
             return self.master_df
@@ -833,26 +837,35 @@ class DataBillContainer:
             "maintenance_site_count": len(sites),
         }
 
-    def eda_meter_patterns(self, window: int = 3) -> dict:
+    def _meter_patterns(self, window: int) -> dict:
         """
-        Classify every unique meter by its bill pattern over its provider's
-        last `window` billed months:
+        Build (and cache) the full per-meter datasheet for the last `window`
+        billed months: one row per unique meter with its monthly bill amounts
+        and a pattern label:
 
           shutdown    — no bill at all in any of the months (site gone)
           maintenance — only the meter charge (0 < amount < 200) every month
           gap         — "ฟันหลอ": billed some months, zero/missing the others
-          normal      — a real bill every month (counted but not listed)
+          normal      — a real bill every month
 
-        One row per unique meter number per provider. Rows without a usable
-        meter number fall back to their Site_ID as identity and report
-        meter_no = None.
+        Rows without a usable meter number fall back to their Site_ID as
+        identity and report meter_no = NA. The cache holds only the most
+        recent window and is cleared whenever the master table is rebuilt.
         """
+        cached = self._meter_patterns_cache.get(window)
+        if cached is not None:
+            return cached
+
         df = self._df()
         counts = {p: 0 for p in (*METER_PATTERN_ORDER, 'normal')}
+        meta_cols = ['meter_no', 'site_id', 'provider', 'company',
+                     'site_type', 'pattern']
+        result = {"months": [], "unique_meters": 0,
+                  "unique_meters_per_provider": {}, "counts": counts,
+                  "table": pd.DataFrame(columns=meta_cols)}
         if df.empty:
-            return {"window": window, "months": [], "unique_meters": 0,
-                    "unique_meters_per_provider": {}, "counts": counts,
-                    "records": []}
+            self._meter_patterns_cache = {window: result}
+            return result
 
         if MEA_METER_COL in df.columns:
             meter = (df[MEA_METER_COL].astype(str).str.strip()
@@ -870,10 +883,11 @@ class DataBillContainer:
                                for p, n in distinct.groupby('provider').size().items()}
 
         all_months: set[int] = set()
-        records: list[dict] = []
+        frames: list[pd.DataFrame] = []
 
         # PEA and MEA exports don't necessarily end on the same month, so each
-        # provider is classified against its own last-N window.
+        # provider is classified against its own last-N window; a month a
+        # provider never billed stays NaN in the combined table (vs 0 = no bill).
         for provider, g in work.groupby('provider'):
             months = sorted(int(m) for m in g['month'].unique())[-window:]
             all_months.update(months)
@@ -883,7 +897,7 @@ class DataBillContainer:
             # the "was anything billed this month?" signal the classes need
             pivot = sub.pivot_table(index='meter_key', columns='month',
                                     values='bill_amount', aggfunc='max')
-            pivot = pivot.reindex(columns=months).fillna(0.0)
+            pivot = pivot.reindex(columns=months).fillna(0.0).round(2)
 
             is_zero = pivot.eq(0)
             is_maint = pivot.gt(0) & pivot.lt(200)
@@ -895,41 +909,115 @@ class DataBillContainer:
             for name, n in pattern.value_counts().items():
                 counts[str(name)] = counts.get(str(name), 0) + int(n)
 
-            flagged = pattern[pattern != 'normal']
-            if flagged.empty:
-                continue
-
-            meta = (sub[sub['meter_key'].isin(flagged.index)]
-                    .sort_values('month')
+            meta = (sub.sort_values('month')
                     .drop_duplicates('meter_key', keep='last')
                     .set_index('meter_key'))
+            idx = pivot.index.to_series().astype(str)
+            frame = pd.DataFrame({
+                'meter_no': idx.mask(idx.str.startswith('SITE:'), other=pd.NA),
+                'site_id': meta['Site_ID'].reindex(pivot.index).astype(str),
+                'provider': str(provider),
+                'company': meta['company'].reindex(pivot.index),
+                'site_type': meta['site_type'].reindex(pivot.index),
+                'pattern': pattern,
+            }, index=pivot.index)
+            frames.append(pd.concat([frame, pivot], axis=1))
 
-            for key, pat in flagged.items():
-                m = meta.loc[key]
-                records.append({
-                    "meter_no": None if str(key).startswith('SITE:') else str(key),
-                    "site_id": str(m['Site_ID']),
-                    "provider": str(provider),
-                    "company": str(m['company']),
-                    "site_type": None if pd.isna(m['site_type']) else str(m['site_type']),
-                    "pattern": str(pat),
-                    "monthly": [{"month": int(mo),
-                                 "bill_amount": round(float(pivot.at[key, mo]), 2)}
-                                for mo in months],
-                })
+        months_sorted = sorted(all_months)
+        table = pd.concat(frames, sort=False)
+        order = {p: i for i, p in enumerate((*METER_PATTERN_ORDER, 'normal'))}
+        table['_ord'] = table['pattern'].map(order)
+        table = (table.sort_values(['_ord', 'provider', 'company', 'site_id'])
+                 .drop(columns='_ord')
+                 .reset_index(drop=True))
+        table = table[meta_cols + months_sorted]
 
-        order = {p: i for i, p in enumerate(METER_PATTERN_ORDER)}
-        records.sort(key=lambda r: (order.get(r['pattern'], len(order)),
-                                    r['provider'], r['company'], r['site_id']))
+        result = {"months": months_sorted, "unique_meters": unique_total,
+                  "unique_meters_per_provider": unique_per_provider,
+                  "counts": counts, "table": table}
+        self._meter_patterns_cache = {window: result}
+        return result
+
+    @staticmethod
+    def _meter_pattern_rows(table: pd.DataFrame, pattern: Optional[str]) -> pd.DataFrame:
+        if pattern and not table.empty:
+            return table[table['pattern'] == pattern]
+        return table
+
+    def eda_meter_patterns(self, window: int = 3,
+                           pattern: Optional[str] = None,
+                           limit: Optional[int] = None,
+                           offset: int = 0) -> dict:
+        """
+        Paged JSON view over the per-meter datasheet built by
+        _meter_patterns(). `pattern` filters to one class; `limit`/`offset`
+        page through the (sorted) rows so the frontend never has to download
+        every meter at once.
+        """
+        data = self._meter_patterns(window)
+        table = self._meter_pattern_rows(data['table'], pattern)
+        months = data['months']
+
+        total = int(len(table))
+        if offset:
+            table = table.iloc[offset:]
+        if limit is not None:
+            table = table.iloc[:max(int(limit), 0)]
+
+        records = [
+            {
+                "meter_no": None if pd.isna(row['meter_no']) else str(row['meter_no']),
+                "site_id": str(row['site_id']),
+                "provider": str(row['provider']),
+                "company": None if pd.isna(row['company']) else str(row['company']),
+                "site_type": None if pd.isna(row['site_type']) else str(row['site_type']),
+                "pattern": str(row['pattern']),
+                "monthly": [{"month": int(m), "bill_amount": round(float(row[m]), 2)}
+                            for m in months if not pd.isna(row.get(m))],
+            }
+            for row in table.to_dict(orient='records')
+        ]
 
         return {
             "window": window,
-            "months": sorted(all_months),
-            "unique_meters": unique_total,
-            "unique_meters_per_provider": unique_per_provider,
-            "counts": counts,
+            "months": months,
+            "unique_meters": data['unique_meters'],
+            "unique_meters_per_provider": data['unique_meters_per_provider'],
+            "counts": data['counts'],
+            "total_records": total,
+            "offset": int(offset),
             "records": records,
         }
+
+    def meter_patterns_csv(self, window: int = 3,
+                           pattern: Optional[str] = None,
+                           chunk_rows: int = 1000):
+        """Yield the meter-pattern datasheet as CSV text, in row chunks so a
+        full export streams without materialising one giant string."""
+        data = self._meter_patterns(window)
+        table = self._meter_pattern_rows(data['table'], pattern)
+        months = data['months']
+
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator='\r\n')
+        writer.writerow(['Meter No', 'Site ID', 'Provider', 'Company', 'Type',
+                         'Pattern'] + [f"{str(m)[:4]}-{str(m)[4:]}" for m in months])
+
+        for start in range(0, len(table), chunk_rows):
+            for row in table.iloc[start:start + chunk_rows].to_dict(orient='records'):
+                writer.writerow(
+                    ['' if pd.isna(row[c]) else str(row[c])
+                     for c in ('meter_no', 'site_id', 'provider', 'company',
+                               'site_type', 'pattern')]
+                    + ['' if pd.isna(row.get(m)) else f"{float(row[m]):.2f}"
+                       for m in months])
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+        remainder = buf.getvalue()
+        if remainder:
+            yield remainder
 
     def eda_error_rates(self) -> dict:
         """Sanity-check / error-rate summary a business user can hand to the billing vendor."""

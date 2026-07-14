@@ -123,6 +123,8 @@ def test_meter_patterns_classification(client):
     assert body["window"] == 3
     assert body["unique_meters"] > 0
     assert set(body["unique_meters_per_provider"]) == {"PEA", "MEA"}
+    # every uploaded meter is listed, normal ones included
+    assert body["total_records"] == len(body["records"]) == body["unique_meters"]
 
     by_meter = {r["meter_no"]: r for r in body["records"]}
     # MEA meter 202 bills 50 THB then 0 -> intermittent "gap" (ฟันหลอ)
@@ -130,13 +132,55 @@ def test_meter_patterns_classification(client):
     assert [m["bill_amount"] for m in by_meter["202"]["monthly"]] == [50.0, 0.0]
     # PEA meter 112 only ever bills below the 200 THB meter charge -> maintenance
     assert by_meter["112"]["pattern"] == "maintenance"
-    # normally billed meters (111, 201) are counted but not listed
-    assert "111" not in by_meter and "201" not in by_meter
+    # normally billed meters are listed with pattern "normal"
+    assert by_meter["111"]["pattern"] == "normal"
+    assert by_meter["201"]["pattern"] == "normal"
     assert body["counts"]["normal"] >= 2
     assert body["counts"]["gap"] >= 1 and body["counts"]["maintenance"] >= 1
 
     # window param is validated
     assert client.get("/api/eda/meter-patterns", params={"window": 0}).status_code == 422
+
+
+def test_meter_patterns_paging_filter_and_export(client):
+    upload_all(client)
+    full = client.get("/api/eda/meter-patterns").json()
+
+    # limit/offset page through the same sorted rows
+    page = client.get("/api/eda/meter-patterns", params={"limit": 1}).json()
+    assert len(page["records"]) == 1
+    assert page["total_records"] == full["total_records"]
+    assert page["records"][0] == full["records"][0]
+    # rows are sorted most severe first -> the maintenance meter leads here
+    assert page["records"][0]["pattern"] == "maintenance"
+    page2 = client.get("/api/eda/meter-patterns",
+                       params={"limit": 1, "offset": 1}).json()
+    assert page2["records"][0] == full["records"][1]
+
+    # pattern filter narrows total_records but keeps global counts
+    normal = client.get("/api/eda/meter-patterns", params={"pattern": "normal"}).json()
+    assert normal["total_records"] == full["counts"]["normal"]
+    assert all(r["pattern"] == "normal" for r in normal["records"])
+    assert normal["counts"] == full["counts"]
+    assert client.get("/api/eda/meter-patterns",
+                      params={"pattern": "bogus"}).status_code == 422
+
+    # CSV export streams the datasheet with a BOM + header + every meter row
+    resp = client.get("/api/eda/meter-patterns/export")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/csv")
+    assert "bill_patterns_all.csv" in resp.headers["content-disposition"]
+    text = resp.text
+    assert text.startswith("﻿")
+    lines = [ln for ln in text.lstrip("﻿").split("\r\n") if ln]
+    assert lines[0].startswith("Meter No,Site ID,Provider,Company,Type,Pattern")
+    assert len(lines) == 1 + full["total_records"]
+    assert any(ln.startswith("112,") for ln in lines)
+
+    filtered = client.get("/api/eda/meter-patterns/export",
+                          params={"pattern": "gap"}).text
+    gap_lines = [ln for ln in filtered.lstrip("﻿").split("\r\n") if ln]
+    assert len(gap_lines) == 1 + full["counts"]["gap"]
 
 
 def test_maintenance_sites_include_meter_no(client):

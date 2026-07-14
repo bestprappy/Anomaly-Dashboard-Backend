@@ -41,7 +41,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -700,14 +700,44 @@ def eda_maintenance_sites():
     return get_container().eda_maintenance_sites()
 
 
+METER_PATTERN_RE = "^(shutdown|maintenance|gap|normal)$"
+
+
 @app.get("/api/eda/meter-patterns")
 def eda_meter_patterns(
     window: int = Query(3, ge=1, le=24, description="how many most-recent months to classify"),
+    pattern: Optional[str] = Query(None, pattern=METER_PATTERN_RE,
+                                   description="only rows of this pattern"),
+    limit: Optional[int] = Query(None, ge=0, le=1000,
+                                 description="page size; omit for all rows"),
+    offset: int = Query(0, ge=0, description="rows to skip (paging)"),
 ):
-    """Per-meter bill pattern over the last N months: shutdown (no bill at
-    all), maintenance (only the meter charge), or gap (billed intermittently,
-    'ฟันหลอ') — plus unique meter counts."""
-    return get_container().eda_meter_patterns(window=window)
+    """Datasheet of every uploaded meter with its last-N-months bill amounts
+    and a pattern label: shutdown (no bill at all), maintenance (only the
+    meter charge), gap (billed intermittently, 'ฟันหลอ') or normal — plus
+    unique meter counts."""
+    return get_container().eda_meter_patterns(
+        window=window, pattern=pattern, limit=limit, offset=offset)
+
+
+@app.get("/api/eda/meter-patterns/export")
+def eda_meter_patterns_export(
+    window: int = Query(3, ge=1, le=24),
+    pattern: Optional[str] = Query(None, pattern=METER_PATTERN_RE),
+):
+    """Stream the full meter-pattern datasheet as a CSV download."""
+    container = get_container()
+    filename = f"bill_patterns_{pattern or 'all'}.csv"
+
+    def generate():
+        yield "\ufeff"  # UTF-8 BOM so Excel renders Thai text correctly
+        yield from container.meter_patterns_csv(window=window, pattern=pattern)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/eda/error-rates")
