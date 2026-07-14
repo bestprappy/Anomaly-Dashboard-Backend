@@ -127,16 +127,16 @@ def test_meter_patterns_classification(client):
     assert body["total_records"] == len(body["records"]) == body["unique_meters"]
 
     by_meter = {r["meter_no"]: r for r in body["records"]}
-    # MEA meter 202 bills 50 THB then 0 -> intermittent "gap" (ฟันหลอ)
+    # MEA meter 202 bills 50 THB then 0 -> intermittent "gap"
     assert by_meter["202"]["pattern"] == "gap"
     assert [m["bill_amount"] for m in by_meter["202"]["monthly"]] == [50.0, 0.0]
-    # PEA meter 112 only ever bills below the 200 THB meter charge -> maintenance
-    assert by_meter["112"]["pattern"] == "maintenance"
-    # normally billed meters are listed with pattern "normal"
+    # meters billed every month are "normal", small amounts included
     assert by_meter["111"]["pattern"] == "normal"
+    assert by_meter["112"]["pattern"] == "normal"
     assert by_meter["201"]["pattern"] == "normal"
-    assert body["counts"]["normal"] >= 2
-    assert body["counts"]["gap"] >= 1 and body["counts"]["maintenance"] >= 1
+    assert body["counts"]["normal"] >= 3
+    assert body["counts"]["gap"] >= 1
+    assert "maintenance" not in body["counts"]
 
     # window param is validated
     assert client.get("/api/eda/meter-patterns", params={"window": 0}).status_code == 422
@@ -151,8 +151,8 @@ def test_meter_patterns_paging_filter_and_export(client):
     assert len(page["records"]) == 1
     assert page["total_records"] == full["total_records"]
     assert page["records"][0] == full["records"][0]
-    # rows are sorted most severe first -> the maintenance meter leads here
-    assert page["records"][0]["pattern"] == "maintenance"
+    # rows are sorted most severe first -> the gap meter leads here
+    assert page["records"][0]["pattern"] == "gap"
     page2 = client.get("/api/eda/meter-patterns",
                        params={"limit": 1, "offset": 1}).json()
     assert page2["records"][0] == full["records"][1]
@@ -164,6 +164,9 @@ def test_meter_patterns_paging_filter_and_export(client):
     assert normal["counts"] == full["counts"]
     assert client.get("/api/eda/meter-patterns",
                       params={"pattern": "bogus"}).status_code == 422
+    # the maintenance pattern was removed from this datasheet
+    assert client.get("/api/eda/meter-patterns",
+                      params={"pattern": "maintenance"}).status_code == 422
 
     # CSV export streams the datasheet with a BOM + header + every meter row
     resp = client.get("/api/eda/meter-patterns/export")

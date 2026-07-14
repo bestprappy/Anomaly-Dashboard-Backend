@@ -64,7 +64,7 @@ PEA_SITE_TYPE_COL_CANDIDATES = ['MSC/RMSC/IBC/WIFI/DeCom', 'MSC/RMSC/IBC/WIFI/DN
 LAST_MONTH_WINDOWS = (3, 6, 9)
 
 # anomalous bill patterns surfaced by eda_meter_patterns, most severe first
-METER_PATTERN_ORDER = ('shutdown', 'maintenance', 'gap')
+METER_PATTERN_ORDER = ('shutdown', 'gap')
 
 
 def _read_any(file: FileLike, header=0) -> pd.DataFrame:
@@ -843,10 +843,9 @@ class DataBillContainer:
         billed months: one row per unique meter with its monthly bill amounts
         and a pattern label:
 
-          shutdown    — no bill at all in any of the months (site gone)
-          maintenance — only the meter charge (0 < amount < 200) every month
-          gap         — "ฟันหลอ": billed some months, zero/missing the others
-          normal      — a real bill every month
+          shutdown — no bill at all in any of the months (site gone)
+          gap      — billed some months, zero/missing the others
+          normal   — billed every month
 
         Rows without a usable meter number fall back to their Site_ID as
         identity and report meter_no = NA. The cache holds only the most
@@ -900,10 +899,8 @@ class DataBillContainer:
             pivot = pivot.reindex(columns=months).fillna(0.0).round(2)
 
             is_zero = pivot.eq(0)
-            is_maint = pivot.gt(0) & pivot.lt(200)
             pattern = pd.Series('normal', index=pivot.index)
             pattern[is_zero.any(axis=1) & (~is_zero).any(axis=1)] = 'gap'
-            pattern[is_maint.all(axis=1)] = 'maintenance'
             pattern[is_zero.all(axis=1)] = 'shutdown'
 
             for name, n in pattern.value_counts().items():

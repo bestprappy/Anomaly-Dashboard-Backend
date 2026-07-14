@@ -700,7 +700,7 @@ def eda_maintenance_sites():
     return get_container().eda_maintenance_sites()
 
 
-METER_PATTERN_RE = "^(shutdown|maintenance|gap|normal)$"
+METER_PATTERN_RE = "^(shutdown|gap|normal)$"
 
 
 @app.get("/api/eda/meter-patterns")
@@ -713,9 +713,8 @@ def eda_meter_patterns(
     offset: int = Query(0, ge=0, description="rows to skip (paging)"),
 ):
     """Datasheet of every uploaded meter with its last-N-months bill amounts
-    and a pattern label: shutdown (no bill at all), maintenance (only the
-    meter charge), gap (billed intermittently, 'ฟันหลอ') or normal — plus
-    unique meter counts."""
+    and a pattern label: shutdown (no bill at all), gap (billed
+    intermittently) or normal — plus unique meter counts."""
     return get_container().eda_meter_patterns(
         window=window, pattern=pattern, limit=limit, offset=offset)
 
