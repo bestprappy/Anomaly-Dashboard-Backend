@@ -1,3 +1,12 @@
+---
+title: Anomaly Dashboard API
+emoji: 📊
+colorFrom: purple
+colorTo: blue
+sdk: docker
+app_port: 7860
+---
+
 # ML Module — Site-Jump Anomaly Detection
 
 This adds a self-contained `app/ml/` package plus `app/routers/ml_routes.py`
