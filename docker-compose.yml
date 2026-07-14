@@ -4,4 +4,4 @@ services:
     container_name: anomaly-api
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "7860:7860"
