@@ -6,6 +6,7 @@ import io
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -138,8 +139,41 @@ def test_meter_patterns_classification(client):
     assert body["counts"]["gap"] >= 1
     assert "maintenance" not in body["counts"]
 
+    # per-company composition adds up to the global stats
+    per_company = body["counts_per_company"]
+    assert per_company, "expected at least one provider/company group"
+    assert sum(e["total"] for e in per_company) == body["unique_meters"]
+    assert sum(e["gap"] for e in per_company) == body["counts"]["gap"]
+    assert sum(e["shutdown"] for e in per_company) == body["counts"]["shutdown"]
+    assert all(set(e) >= {"provider", "company", "shutdown", "gap",
+                          "normal", "total"} for e in per_company)
+
     # window param is validated
     assert client.get("/api/eda/meter-patterns", params={"window": 0}).status_code == 422
+
+
+def test_meter_patterns_keep_meters_missing_from_recent_provider_window():
+    container = DataBillContainer()
+    container.master_df = pd.DataFrame([
+        {"Meter_No": "101", "Site_ID": "CURRENT101", "provider": "MEA",
+         "company": "BFKT", "site_type": "NORMAL", "month": month,
+         "bill_amount": 100.0}
+        for month in (202402, 202403, 202404)
+    ] + [
+        {"Meter_No": "202", "Site_ID": "HISTORIC202", "provider": "MEA",
+         "company": "TUC", "site_type": "NORMAL", "month": 202401,
+         "bill_amount": 75.0}
+    ])
+
+    body = container.eda_meter_patterns(window=3)
+    by_meter = {row["meter_no"]: row for row in body["records"]}
+
+    assert body["unique_meters"] == body["total_records"] == 2
+    assert body["counts"] == {"shutdown": 1, "gap": 0, "normal": 1}
+    assert by_meter["202"]["pattern"] == "shutdown"
+    assert [month["bill_amount"] for month in by_meter["202"]["monthly"]] == [
+        0.0, 0.0, 0.0]
+    assert sum(group["total"] for group in body["counts_per_company"]) == 2
 
 
 def test_meter_patterns_paging_filter_and_export(client):
@@ -162,6 +196,7 @@ def test_meter_patterns_paging_filter_and_export(client):
     assert normal["total_records"] == full["counts"]["normal"]
     assert all(r["pattern"] == "normal" for r in normal["records"])
     assert normal["counts"] == full["counts"]
+    assert normal["counts_per_company"] == full["counts_per_company"]
     assert client.get("/api/eda/meter-patterns",
                       params={"pattern": "bogus"}).status_code == 422
     # the maintenance pattern was removed from this datasheet

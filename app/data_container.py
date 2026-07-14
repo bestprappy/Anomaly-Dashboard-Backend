@@ -861,6 +861,7 @@ class DataBillContainer:
                      'site_type', 'pattern']
         result = {"months": [], "unique_meters": 0,
                   "unique_meters_per_provider": {}, "counts": counts,
+                  "counts_per_company": [],
                   "table": pd.DataFrame(columns=meta_cols)}
         if df.empty:
             self._meter_patterns_cache = {window: result}
@@ -891,12 +892,18 @@ class DataBillContainer:
             months = sorted(int(m) for m in g['month'].unique())[-window:]
             all_months.update(months)
             sub = g[g['month'].isin(months)]
+            meter_universe = pd.Index(
+                g['meter_key'].drop_duplicates(), name='meter_key')
 
             # max-aggregation both dedupes repeated meter rows and preserves
             # the "was anything billed this month?" signal the classes need
             pivot = sub.pivot_table(index='meter_key', columns='month',
                                     values='bill_amount', aggfunc='max')
-            pivot = pivot.reindex(columns=months).fillna(0.0).round(2)
+            # A company's export can lag another company under the same
+            # provider. Keep its known meters in the recent provider window;
+            # no recent rows is a real all-zero (shutdown) pattern.
+            pivot = (pivot.reindex(index=meter_universe, columns=months)
+                     .fillna(0.0).round(2))
 
             is_zero = pivot.eq(0)
             pattern = pd.Series('normal', index=pivot.index)
@@ -906,7 +913,7 @@ class DataBillContainer:
             for name, n in pattern.value_counts().items():
                 counts[str(name)] = counts.get(str(name), 0) + int(n)
 
-            meta = (sub.sort_values('month')
+            meta = (g.sort_values('month')
                     .drop_duplicates('meter_key', keep='last')
                     .set_index('meter_key'))
             idx = pivot.index.to_series().astype(str)
@@ -929,9 +936,23 @@ class DataBillContainer:
                  .reset_index(drop=True))
         table = table[meta_cols + months_sorted]
 
+        # pattern composition per provider/company — feeds the chart view
+        grouped = (table.groupby(['provider', 'company'], dropna=False)['pattern']
+                   .value_counts().unstack(fill_value=0))
+        per_company = []
+        for (prov, comp), row in grouped.iterrows():
+            entry = {"provider": str(prov),
+                     "company": None if pd.isna(comp) else str(comp)}
+            for p in (*METER_PATTERN_ORDER, 'normal'):
+                entry[p] = int(row.get(p, 0))
+            entry["total"] = int(row.sum())
+            per_company.append(entry)
+        per_company.sort(key=lambda e: (e["provider"], e["company"] or ""))
+
         result = {"months": months_sorted, "unique_meters": unique_total,
                   "unique_meters_per_provider": unique_per_provider,
-                  "counts": counts, "table": table}
+                  "counts": counts, "counts_per_company": per_company,
+                  "table": table}
         self._meter_patterns_cache = {window: result}
         return result
 
@@ -981,6 +1002,7 @@ class DataBillContainer:
             "unique_meters": data['unique_meters'],
             "unique_meters_per_provider": data['unique_meters_per_provider'],
             "counts": data['counts'],
+            "counts_per_company": data['counts_per_company'],
             "total_records": total,
             "offset": int(offset),
             "records": records,
