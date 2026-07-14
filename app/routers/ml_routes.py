@@ -45,6 +45,14 @@ from app.ml.config import ClassifyThresholds, DateRange, DROP_OPTIONS, DROP_OPTI
 from app.ml.pipeline import abnormal_dataframe, build_pipeline, classify_pipeline, preview_missing_rate
 from app.ml.plotting import render_all_zip, render_examples, yyyymm_to_period
 from app.ml.schemas import BuildRequest, ClassifyRequest, PreviewRequest
+from app.ml.severity_duration import (
+    DURATION_BANDS,
+    SEVERITY_BANDS,
+    SeverityDurationConfig,
+    build_severity_duration_events,
+    duration_intuition_report,
+    severity_duration_matrix,
+)
 from app.ml.state import ML_STATE
 from app.ml.impact import monthly_impact_summary, residual_impact
 
@@ -97,6 +105,109 @@ def _resolve_plot_range(
         end_period = yyyymm_to_period(default_end) + 1
 
     return start_period, end_period
+
+
+def _severity_duration_payload() -> dict:
+    """Build the UI contract from the current classified model run."""
+
+    classifier = ML_STATE.thresholds
+    config = SeverityDurationConfig(
+        up_ratio=classifier.up,
+        elevated_ratio=classifier.sustain,
+    )
+    events = build_severity_duration_events(
+        ML_STATE.classified,
+        ML_STATE.full_history,
+        config,
+    )
+    counts = severity_duration_matrix(events)
+    row_percentages = severity_duration_matrix(events, row_percent=True)
+    cells = [
+        {
+            "duration_band": duration,
+            "severity_band": severity,
+            "count": int(counts.loc[duration, severity]),
+            "row_percent": float(row_percentages.loc[duration, severity]),
+        }
+        for duration in DURATION_BANDS
+        for severity in SEVERITY_BANDS
+    ]
+
+    status_counts = (
+        events["duration_status"].fillna("unknown").value_counts().to_dict()
+        if not events.empty
+        else {}
+    )
+    matrix_events = int(counts.to_numpy().sum())
+    right_censored = (
+        int(events["right_censored"].fillna(False).astype(bool).sum())
+        if not events.empty
+        else 0
+    )
+    unconfirmed = (
+        int((~events["duration_confirmed"].fillna(False).astype(bool)).sum())
+        if not events.empty
+        else 0
+    )
+
+    return {
+        "axes": {
+            "x": {
+                "key": "severity_band",
+                "label": "Severity score",
+                "bands": list(SEVERITY_BANDS),
+            },
+            "y": {
+                "key": "duration_band",
+                "label": "Duration",
+                "bands": list(DURATION_BANDS),
+            },
+        },
+        # Row-major duration x severity order; this list is always exactly 9 cells.
+        "cells": cells,
+        "counts": {
+            "total_events": int(len(events)),
+            "matrix_events": matrix_events,
+            "excluded_from_matrix": int(len(events) - matrix_events),
+            "right_censored_events": right_censored,
+            "unconfirmed_duration_events": unconfirmed,
+        },
+        "thresholds": {
+            "severity_score": {
+                "formula": "max(actual_kwh - q95, 0) / max(q95 - q05, 1e-9)",
+                "medium_min": config.severity_medium_min,
+                "high_min": config.severity_high_min,
+                "bands": {
+                    "Low": f"< {config.severity_medium_min:g}",
+                    "Medium": (
+                        f">= {config.severity_medium_min:g} and "
+                        f"< {config.severity_high_min:g}"
+                    ),
+                    "High": f">= {config.severity_high_min:g}",
+                },
+            },
+            "duration": {
+                "baseline_months": config.baseline_months,
+                "minimum_baseline_months": config.min_baseline_months,
+                "event_start_ratio": config.up_ratio,
+                "elevated_ratio": config.elevated_ratio,
+                "bands_months": {
+                    "Single month": "1",
+                    "2-3 months": "2-3",
+                    ">=4 months": ">=4",
+                },
+            },
+            "classifier": {
+                "up_ratio": classifier.up,
+                "down_ratio": classifier.down,
+                "sustain_ratio": classifier.sustain,
+            },
+        },
+        "duration_status_counts": {
+            str(key): int(value) for key, value in status_counts.items()
+        },
+        "intuition_report": duration_intuition_report(events),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -174,6 +285,23 @@ async def classify(body: ClassifyRequest):
     else:
         rows = []
     return {"type_counts": counts, "surfaced_types": list(SURFACED_TYPES), "rows": rows}
+
+
+@router.get("/severity-duration")
+async def severity_duration():
+    """Return the event-level 3 x 3 severity/duration matrix and audit data."""
+
+    _require_classified()
+    try:
+        return await run_in_threadpool(_severity_duration_payload)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Severity-duration analysis failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Severity-duration analysis failed: {str(e)[:200]}",
+        ) from e
 
 
 @router.get("/examples")

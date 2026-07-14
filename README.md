@@ -115,6 +115,7 @@ well" readout before the user moves to Result.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/ml/classify` | user-input UP/DOWN/SUSTAIN → type counts + surfaced (spike_up/step_up) rows |
+| GET | `/api/ml/severity-duration` | nine-cell severity x duration matrix for the latest classification |
 | GET | `/api/ml/examples?anom_type=spike_up&limit=5` | up to 5 base64 PNGs |
 | GET | `/api/ml/plots/download?types=spike_up,step_up` | zip of every plot for the requested types |
 
@@ -151,3 +152,31 @@ can drop straight into `<img src="data:image/png;base64,...">`.
   `/examples`, and `/plots/download` (`step_down`/`spike_down`/`other` are
   still computed internally for correctness, just not returned), per "just 2
   types we concern about."
+
+## Severity-duration 3 x 3 analysis notebook
+
+`notebooks/severity_duration_matrix.ipynb` runs the production preprocessing,
+quantile model, and classifier, then converts the flagged site-months into one
+row per event. It produces a matrix with severity on the columns (Low < 1,
+Medium 1 to < 3, High >= 3 band widths beyond q95) and observed duration on
+the rows (single month, 2-3 months, >=4 months).
+
+With `DATA_MODE = "auto"`, the notebook uses all five exports under
+`app/ml/data/` when they are available and otherwise falls back to a
+deterministic synthetic demo. The raw-data directory is ignored by Git so
+confidential billing exports are not committed. Raw mode calls
+`DataBillContainer.load_files()` and therefore uses the same PEA/MEA cleaning
+as the API. Run Jupyter from this backend directory with the backend
+environment selected as the notebook kernel, for example on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install jupyterlab ipykernel
+.\.venv\Scripts\python.exe -m jupyter lab
+```
+
+The reusable event logic lives in `app/ml/severity_duration.py`. It merges
+consecutive flags from the same elevated run, assigns severity from the first
+surfaced detection, and keeps short right-censored events out of the matrix
+rather than silently calling them spikes. Set `EXPORT_RESULTS = True` in the
+notebook to write the event audit, both matrices, and run metadata under
+`notebooks/outputs/`.

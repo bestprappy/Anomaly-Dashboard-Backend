@@ -431,6 +431,7 @@ def test_ml_pipeline_end_to_end(client):
     # ML endpoints that need a model must 409 before any build
     assert client.get("/api/ml/abnormal").status_code == 409
     assert client.post("/api/ml/classify", json={}).status_code == 409
+    assert client.get("/api/ml/severity-duration").status_code == 409
     assert client.get("/api/ml/examples", params={"anom_type": "spike_up"}).status_code == 409
 
     resp = client.post("/api/ml/preview", json={
@@ -466,6 +467,38 @@ def test_ml_pipeline_end_to_end(client):
     for row in cls["rows"]:
         assert set(row) >= {"site_id", "anom_month", "anom_val",
                             "anom_type", "quantile_severity"}
+
+    resp = client.get("/api/ml/severity-duration")
+    assert resp.status_code == 200, resp.text
+    matrix = resp.json()
+    assert matrix["axes"]["x"]["bands"] == ["Low", "Medium", "High"]
+    assert matrix["axes"]["y"]["bands"] == [
+        "Single month", "2-3 months", ">=4 months"]
+    assert len(matrix["cells"]) == 9
+    assert {
+        (cell["duration_band"], cell["severity_band"])
+        for cell in matrix["cells"]
+    } == {
+        (duration, severity)
+        for duration in matrix["axes"]["y"]["bands"]
+        for severity in matrix["axes"]["x"]["bands"]
+    }
+    assert all(set(cell) == {
+        "duration_band", "severity_band", "count", "row_percent"
+    } for cell in matrix["cells"])
+    assert sum(cell["count"] for cell in matrix["cells"]) == matrix["counts"]["matrix_events"]
+    assert matrix["counts"]["matrix_events"] <= matrix["counts"]["total_events"]
+    assert matrix["counts"]["excluded_from_matrix"] == (
+        matrix["counts"]["total_events"] - matrix["counts"]["matrix_events"])
+    assert set(matrix) == {
+        "axes", "cells", "counts", "thresholds",
+        "duration_status_counts", "intuition_report"}
+    assert matrix["thresholds"]["severity_score"]["medium_min"] == 1.0
+    assert matrix["thresholds"]["severity_score"]["high_min"] == 3.0
+    assert matrix["thresholds"]["duration"]["bands_months"] == {
+        "Single month": "1", "2-3 months": "2-3", ">=4 months": ">=4"}
+    assert set(matrix["intuition_report"]["by_duration"]) == {
+        "Single month", "2-3 months", ">=4 months"}
 
     resp = client.get("/api/ml/examples", params={"anom_type": "spike_up", "limit": 3})
     assert resp.status_code == 200, resp.text

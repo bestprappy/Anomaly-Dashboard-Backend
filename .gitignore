@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .venv/
+notebooks/.ipynb_checkpoints/
+notebooks/outputs/
+/app/ml/data/
