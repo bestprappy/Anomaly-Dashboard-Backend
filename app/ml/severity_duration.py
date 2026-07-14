@@ -432,10 +432,21 @@ def severity_duration_matrix(events: pd.DataFrame, *, row_percent: bool = False)
         & events["duration_band"].notna()
         & events["severity_band"].notna()
     ]
-    counts = pd.crosstab(eligible["duration_band"], eligible["severity_band"], dropna=False)
-    counts = counts.reindex(index=DURATION_BANDS, columns=SEVERITY_BANDS, fill_value=0).astype(int)
-    counts.index.name = "Duration"
-    counts.columns.name = "Severity"
+    # Start from fixed axes instead of relying on crosstab to expand empty
+    # categoricals. Some pandas 2.x releases create duplicate category labels
+    # when ``eligible`` is empty, which then makes ``reindex`` fail.
+    counts = pd.DataFrame(
+        0,
+        index=pd.Index(DURATION_BANDS, name="Duration"),
+        columns=pd.Index(SEVERITY_BANDS, name="Severity"),
+        dtype=int,
+    )
+    observed = eligible.groupby(
+        ["duration_band", "severity_band"], observed=True
+    ).size()
+    for (duration, severity), count in observed.items():
+        if duration in DURATION_BANDS and severity in SEVERITY_BANDS:
+            counts.loc[duration, severity] = int(count)
     if not row_percent:
         return counts
     denominator = counts.sum(axis=1).replace(0, np.nan)

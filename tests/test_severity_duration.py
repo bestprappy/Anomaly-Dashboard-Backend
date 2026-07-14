@@ -212,7 +212,11 @@ def test_short_end_of_history_run_is_right_censored_and_excluded_from_matrix() -
     assert not bool(event["duration_confirmed"])
     assert bool(event["right_censored"])
     assert event["duration_status"] == "end_of_history"
-    assert severity_duration_matrix(events).to_numpy().sum() == 0
+    matrix = severity_duration_matrix(events)
+    assert matrix.shape == (3, 3)
+    assert matrix.index.tolist() == list(DURATION_BANDS)
+    assert matrix.columns.tolist() == list(SEVERITY_BANDS)
+    assert matrix.to_numpy().sum() == 0
 
 
 def test_missing_calendar_month_censors_duration_instead_of_bridging_gap() -> None:
