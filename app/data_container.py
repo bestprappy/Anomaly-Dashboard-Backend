@@ -62,6 +62,9 @@ PEA_SITE_TYPE_COL_CANDIDATES = ['MSC/RMSC/IBC/WIFI/DeCom', 'MSC/RMSC/IBC/WIFI/DN
 
 LAST_MONTH_WINDOWS = (3, 6, 9)
 
+# anomalous bill patterns surfaced by eda_meter_patterns, most severe first
+METER_PATTERN_ORDER = ('shutdown', 'maintenance', 'gap')
+
 
 def _read_any(file: FileLike, header=0) -> pd.DataFrame:
     """Read a csv or xlsx upload into a DataFrame, tolerant of file-likes / bytes."""
@@ -118,6 +121,14 @@ def _normalise_mea_site_type(val) -> str:
     if v == 'MSC':
         return 'MSC'
     return v
+
+
+def _meter_str(val) -> Optional[str]:
+    """Meter number as a clean display string ('112.0' -> '112'), or None."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    return re.sub(r'\.0+$', '', s) or None
 
 
 def classify_bill(amount) -> str:
@@ -783,6 +794,8 @@ class DataBillContainer:
         """
         df = self._df()
         maint = df[df['bill_class'] == 'maintenance']
+        if MEA_METER_COL not in maint.columns:
+            maint = maint.assign(**{MEA_METER_COL: np.nan})
 
         vc = maint['bill_amount'].round(2).value_counts().sort_index()
 
@@ -793,7 +806,8 @@ class DataBillContainer:
             recent_maint
             .sort_values('date')
             .drop_duplicates(subset=['Site_ID', 'provider', 'company'], keep='last')
-            [['Site_ID', 'provider', 'company', 'site_type', 'bill_amount', 'date']]
+            [['Site_ID', MEA_METER_COL, 'provider', 'company', 'site_type',
+              'bill_amount', 'date']]
             .rename(columns={'date': 'last_maintenance_month'})
             .sort_values(['provider', 'company', 'Site_ID'])
         )
@@ -801,6 +815,7 @@ class DataBillContainer:
         sites = [
             {
                 "site_id": r.Site_ID,
+                "meter_no": _meter_str(r.Meter_No),
                 "provider": r.provider,   # PEA or MEA
                 "company": r.company,     # BFKT / TUC / TMV
                 "site_type": None if pd.isna(r.site_type) else str(r.site_type),
@@ -816,6 +831,104 @@ class DataBillContainer:
             "value_counts": [{"amount": float(k), "count": int(v)} for k, v in vc.items()],
             "maintenance_sites_last_{}_months".format(months_window): sites,
             "maintenance_site_count": len(sites),
+        }
+
+    def eda_meter_patterns(self, window: int = 3) -> dict:
+        """
+        Classify every unique meter by its bill pattern over its provider's
+        last `window` billed months:
+
+          shutdown    — no bill at all in any of the months (site gone)
+          maintenance — only the meter charge (0 < amount < 200) every month
+          gap         — "ฟันหลอ": billed some months, zero/missing the others
+          normal      — a real bill every month (counted but not listed)
+
+        One row per unique meter number per provider. Rows without a usable
+        meter number fall back to their Site_ID as identity and report
+        meter_no = None.
+        """
+        df = self._df()
+        counts = {p: 0 for p in (*METER_PATTERN_ORDER, 'normal')}
+        if df.empty:
+            return {"window": window, "months": [], "unique_meters": 0,
+                    "unique_meters_per_provider": {}, "counts": counts,
+                    "records": []}
+
+        if MEA_METER_COL in df.columns:
+            meter = (df[MEA_METER_COL].astype(str).str.strip()
+                     .str.replace(r'\.0+$', '', regex=True))
+        else:
+            meter = pd.Series('', index=df.index)
+        bad = meter.isin(('', '0', 'nan', 'NaN', 'NAN', 'None', 'NONE'))
+        work = df[['provider', 'company', 'Site_ID', 'site_type',
+                   'month', 'bill_amount']].copy()
+        work['meter_key'] = meter.mask(bad, 'SITE:' + df['Site_ID'].astype(str))
+
+        distinct = work.drop_duplicates(['provider', 'meter_key'])
+        unique_total = int(len(distinct))
+        unique_per_provider = {str(p): int(n)
+                               for p, n in distinct.groupby('provider').size().items()}
+
+        all_months: set[int] = set()
+        records: list[dict] = []
+
+        # PEA and MEA exports don't necessarily end on the same month, so each
+        # provider is classified against its own last-N window.
+        for provider, g in work.groupby('provider'):
+            months = sorted(int(m) for m in g['month'].unique())[-window:]
+            all_months.update(months)
+            sub = g[g['month'].isin(months)]
+
+            # max-aggregation both dedupes repeated meter rows and preserves
+            # the "was anything billed this month?" signal the classes need
+            pivot = sub.pivot_table(index='meter_key', columns='month',
+                                    values='bill_amount', aggfunc='max')
+            pivot = pivot.reindex(columns=months).fillna(0.0)
+
+            is_zero = pivot.eq(0)
+            is_maint = pivot.gt(0) & pivot.lt(200)
+            pattern = pd.Series('normal', index=pivot.index)
+            pattern[is_zero.any(axis=1) & (~is_zero).any(axis=1)] = 'gap'
+            pattern[is_maint.all(axis=1)] = 'maintenance'
+            pattern[is_zero.all(axis=1)] = 'shutdown'
+
+            for name, n in pattern.value_counts().items():
+                counts[str(name)] = counts.get(str(name), 0) + int(n)
+
+            flagged = pattern[pattern != 'normal']
+            if flagged.empty:
+                continue
+
+            meta = (sub[sub['meter_key'].isin(flagged.index)]
+                    .sort_values('month')
+                    .drop_duplicates('meter_key', keep='last')
+                    .set_index('meter_key'))
+
+            for key, pat in flagged.items():
+                m = meta.loc[key]
+                records.append({
+                    "meter_no": None if str(key).startswith('SITE:') else str(key),
+                    "site_id": str(m['Site_ID']),
+                    "provider": str(provider),
+                    "company": str(m['company']),
+                    "site_type": None if pd.isna(m['site_type']) else str(m['site_type']),
+                    "pattern": str(pat),
+                    "monthly": [{"month": int(mo),
+                                 "bill_amount": round(float(pivot.at[key, mo]), 2)}
+                                for mo in months],
+                })
+
+        order = {p: i for i, p in enumerate(METER_PATTERN_ORDER)}
+        records.sort(key=lambda r: (order.get(r['pattern'], len(order)),
+                                    r['provider'], r['company'], r['site_id']))
+
+        return {
+            "window": window,
+            "months": sorted(all_months),
+            "unique_meters": unique_total,
+            "unique_meters_per_provider": unique_per_provider,
+            "counts": counts,
+            "records": records,
         }
 
     def eda_error_rates(self) -> dict:

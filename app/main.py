@@ -700,6 +700,16 @@ def eda_maintenance_sites():
     return get_container().eda_maintenance_sites()
 
 
+@app.get("/api/eda/meter-patterns")
+def eda_meter_patterns(
+    window: int = Query(3, ge=1, le=24, description="how many most-recent months to classify"),
+):
+    """Per-meter bill pattern over the last N months: shutdown (no bill at
+    all), maintenance (only the meter charge), or gap (billed intermittently,
+    'ฟันหลอ') — plus unique meter counts."""
+    return get_container().eda_meter_patterns(window=window)
+
+
 @app.get("/api/eda/error-rates")
 def eda_error_rates():
     return get_container().eda_error_rates()

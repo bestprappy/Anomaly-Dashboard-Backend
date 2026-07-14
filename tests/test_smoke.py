@@ -106,12 +106,45 @@ def test_upload_and_all_eda_endpoints(client):
 
     for path in ("summary", "bill-range", "duplicates", "common-sites",
                  "site-types", "missing-consequence", "maintenance-sites",
-                 "error-rates"):
+                 "meter-patterns", "error-rates"):
         resp = client.get(f"/api/eda/{path}")
         assert resp.status_code == 200, f"{path}: {resp.text[:300]}"
         resp.json()  # must be valid JSON (no NaN)
 
     assert client.get("/api/upload/status").json()["rows_total"] > 0
+
+
+def test_meter_patterns_classification(client):
+    upload_all(client)
+    resp = client.get("/api/eda/meter-patterns")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["window"] == 3
+    assert body["unique_meters"] > 0
+    assert set(body["unique_meters_per_provider"]) == {"PEA", "MEA"}
+
+    by_meter = {r["meter_no"]: r for r in body["records"]}
+    # MEA meter 202 bills 50 THB then 0 -> intermittent "gap" (ฟันหลอ)
+    assert by_meter["202"]["pattern"] == "gap"
+    assert [m["bill_amount"] for m in by_meter["202"]["monthly"]] == [50.0, 0.0]
+    # PEA meter 112 only ever bills below the 200 THB meter charge -> maintenance
+    assert by_meter["112"]["pattern"] == "maintenance"
+    # normally billed meters (111, 201) are counted but not listed
+    assert "111" not in by_meter and "201" not in by_meter
+    assert body["counts"]["normal"] >= 2
+    assert body["counts"]["gap"] >= 1 and body["counts"]["maintenance"] >= 1
+
+    # window param is validated
+    assert client.get("/api/eda/meter-patterns", params={"window": 0}).status_code == 422
+
+
+def test_maintenance_sites_include_meter_no(client):
+    upload_all(client)
+    sites = client.get("/api/eda/maintenance-sites").json()[
+        "maintenance_sites_last_6_months"]
+    assert sites, "synthetic data must produce at least one maintenance site"
+    assert all("meter_no" in s for s in sites)
 
 
 def test_bad_windows_param_returns_400(client):
