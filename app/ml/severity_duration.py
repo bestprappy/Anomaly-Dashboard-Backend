@@ -19,6 +19,12 @@ right-censored.  They are retained in the event audit table but excluded from
 the matrix because they may later move from 1 to 2-3 or >=4 months.  Once four
 elevated months have been observed, the >=4 bucket is known even if the event
 has not ended.
+
+Each confirmed (duration_band, severity_band) cell also maps to a fixed
+business ``action`` — Ignore / Review / Investigate — via ``action_for`` /
+``ACTION_MATRIX_BY_BAND``.  This is what downstream consumers (the event
+table, the bulk plot export in ``app/ml/plotting.py``) use to turn the matrix
+into a worklist rather than just a report.
 """
 from __future__ import annotations
 
@@ -34,6 +40,29 @@ from app.ml.classify import SURFACED_TYPES
 
 SEVERITY_BANDS = ("Low", "Medium", "High")
 DURATION_BANDS = ("Single month", "2-3 months", ">=4 months")
+
+# Business action per confirmed (duration_band, severity_band) cell.
+# Ordered least -> most urgent; order matters for _ACTION_PRIORITY below,
+# which resolves "this site has multiple events with different actions"
+# down to the single most urgent one.
+ACTION_LABELS = ("Ignore", "Review", "Investigate")
+
+_ACTION_MATRIX: dict[tuple[str, str], str] = {
+    ("Single month", "Low"): "Ignore",
+    ("Single month", "Medium"): "Review",
+    ("Single month", "High"): "Investigate",
+    ("2-3 months", "Low"): "Review",
+    ("2-3 months", "Medium"): "Review",
+    ("2-3 months", "High"): "Investigate",
+    (">=4 months", "Low"): "Investigate",
+    (">=4 months", "Medium"): "Investigate",
+    (">=4 months", "High"): "Investigate",
+}
+
+# Priority order for picking one action when something (e.g. a site's export
+# folder) has to resolve multiple events down to a single action — always
+# surface the most urgent one, never let "Investigate" hide behind "Ignore".
+ACTION_PRIORITY = {label: i for i, label in enumerate(ACTION_LABELS)}
 
 EVENT_COLUMNS = [
     "site_id",
@@ -55,6 +84,7 @@ EVENT_COLUMNS = [
     "detection_quantile_severity",
     "peak_quantile_severity",
     "severity_band",
+    "action",
     "detection_anom_type",
     "expected_type_from_duration",
     "intuition_match",
@@ -126,6 +156,32 @@ def severity_band(
         labels=SEVERITY_BANDS,
         right=False,
         ordered=True,
+    )
+
+
+def action_for(duration_band, severity_band_value) -> str | None:
+    """Business action for a confirmed (duration_band, severity_band) cell.
+
+    Returns None when either band is unset — e.g. an event whose duration
+    hasn't been confirmed yet (still open, under 4 elevated months, so it
+    could still move rows). Callers should treat None as "not enough data
+    to act on yet", not default it to any particular action.
+    """
+    if pd.isna(duration_band) or pd.isna(severity_band_value):
+        return None
+    return _ACTION_MATRIX.get((str(duration_band), str(severity_band_value)))
+
+
+def action_matrix() -> pd.DataFrame:
+    """Static 3x3 grid of the business action per (duration, severity) cell.
+
+    Same axes as severity_duration_matrix() — lets the frontend render the
+    action legend without hardcoding the 9 labels client-side.
+    """
+    return pd.DataFrame(
+        [[_ACTION_MATRIX[(d, s)] for s in SEVERITY_BANDS] for d in DURATION_BANDS],
+        index=pd.Index(DURATION_BANDS, name="Duration"),
+        columns=pd.Index(SEVERITY_BANDS, name="Severity"),
     )
 
 
@@ -343,6 +399,10 @@ def build_severity_duration_events(
     at the observed event onset. ``detection_quantile_severity`` is used for
     the matrix because an unflagged earlier onset has no model severity score;
     peak severity is kept only as a descriptive field.
+
+    Each event also gets an ``action`` (Ignore / Review / Investigate / None)
+    from ``action_for(duration_band, severity_band)`` — None when duration
+    isn't confirmed yet, since there isn't enough data to act on.
     """
 
     flags = _normalise_classified(classified)
@@ -377,6 +437,7 @@ def build_severity_duration_events(
             peak_severity = float(in_event["quantile_severity"].max())
             band = severity_band(pd.Series([detection_severity]), config).iloc[0]
             duration_band = measured["duration_band"]
+            action = action_for(duration_band, band)
             if pd.isna(duration_band):
                 expected_type = pd.NA
             elif duration_band == DURATION_BANDS[0]:
@@ -401,6 +462,7 @@ def build_severity_duration_events(
                     "detection_quantile_severity": detection_severity,
                     "peak_quantile_severity": peak_severity,
                     "severity_band": band,
+                    "action": action,
                     "detection_anom_type": seed.anom_type,
                     "expected_type_from_duration": expected_type,
                     "intuition_match": match,
@@ -416,6 +478,9 @@ def build_severity_duration_events(
     )
     events["severity_band"] = pd.Categorical(
         events["severity_band"], categories=SEVERITY_BANDS, ordered=True
+    )
+    events["action"] = pd.Categorical(
+        events["action"], categories=ACTION_LABELS, ordered=True
     )
     return events.sort_values(["site_id", "start_month"], kind="stable").reset_index(drop=True)
 

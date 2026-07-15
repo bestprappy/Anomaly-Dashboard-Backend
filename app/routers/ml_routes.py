@@ -327,7 +327,6 @@ def examples(
         ],
     }
 
-
 @router.get("/plots/download")
 def download_plots(
     types: str = Query("spike_up,step_up", description="comma-separated: spike_up,step_up"),
@@ -345,7 +344,14 @@ def download_plots(
     flag = ML_STATE.classified
     series_map = build_site_series(ML_STATE.full_history, set(flag["site_id"].unique()))
     start_period, end_period = _resolve_plot_range(plot_start, plot_end)
-    zip_bytes = render_all_zip(flag, series_map, requested,
+
+    # Same event table the /severity-duration matrix uses, so the zip's
+    # Investigate/Review/Ignore folders agree exactly with what the UI shows.
+    classifier = ML_STATE.thresholds
+    config = SeverityDurationConfig(up_ratio=classifier.up, elevated_ratio=classifier.sustain)
+    events = build_severity_duration_events(ML_STATE.classified, ML_STATE.full_history, config)
+
+    zip_bytes = render_all_zip(flag, series_map, requested, events=events,
                                 start_period=start_period, end_period=end_period)
     return Response(
         content=zip_bytes,

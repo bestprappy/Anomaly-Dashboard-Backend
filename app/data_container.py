@@ -366,7 +366,18 @@ class DataBillContainer:
         raw = raw[raw['site_type'] != 'MSC']
         report.notes.append(f"Dropped {before - len(raw)} MSC rows.")
 
+        # drop Site_ID == '0' (no site attached to meter) — same as PEA
+        if 'Site_ID' in raw.columns:
+            raw['Site_ID'] = raw['Site_ID'].astype(str).str.strip().str.upper().replace(
+                {'0.0': '0', 'NAN': '0', 'NONE': '0', '': '0'}
+            )
+            before = len(raw)
+            raw = raw[raw['Site_ID'] != '0']
+            report.notes.append(f"Dropped {before - len(raw)} rows with Site_ID == '0'.")
+
         amt_cols, unit_cols = self._mea_month_columns(raw)
+        logger.info(amt_cols)
+        logger.info(unit_cols)
 
         # Prune to the columns the melt keeps, then convert the monthly block
         # to float32 column-by-column *before* melting (512 MB instance: the
@@ -379,7 +390,12 @@ class DataBillContainer:
 
         converted = {}
         for col in amt_cols + unit_cols:
-            converted[col] = pd.to_numeric(raw[col], errors='coerce').astype(np.float32)
+            s = raw[col]
+            if s.dtype == object:
+                s = pd.to_numeric(_clean_numeric_string(s), errors="coerce")
+            else:
+                s = pd.to_numeric(s, errors="coerce")
+            converted[col] = s.astype(np.float32)
         raw = pd.concat(
             [raw.drop(columns=amt_cols + unit_cols),
              pd.DataFrame(converted, index=raw.index)],
@@ -411,7 +427,7 @@ class DataBillContainer:
         report.removed_rows = report.rows_raw - report.rows_after_clean
         if 'Site_ID' in raw.columns:
             self.site_frames[key] = raw[['Site_ID', 'company', 'provider']].copy()
-        self.long_frames[key] = self._melt_mea(raw)
+        self.long_frames[key] = self._melt_mea(raw, amt_cols, unit_cols)
         del raw
         gc.collect()
         self.load_reports[key] = report
@@ -422,17 +438,38 @@ class DataBillContainer:
         """
         Split the monthly columns into (amount_cols, unit_cols).
 
-        The original Excel exports let us tell the two blocks apart by dtype
-        (Excel keeps a bare numeric header like 201901 as an int for the
-        amount block, while the duplicate-named unit-block header gets
-        pandas' '.1' mangling and becomes a string). CSV uploads lose that
-        distinction — every header is a plain string — so we fall back to
-        position: the amount block and unit block are each internally
-        chronological, so the point where the running max month resets is
-        the block boundary.
+        Every MEA export carries two 'Avg'/'avg' marker columns, each
+        immediately followed by the 89-month block: Avg, <amount block>,
+        Avg, <unit block>. This mirrors the layout _load_pea already
+        splits on, so we use the same two-marker approach here instead of
+        inferring the boundary from column dtype or a "running max reset"
+        heuristic.
+
+        The old heuristic broke on CSV uploads: pandas dedupes the two
+        identically-named month blocks by suffixing the second occurrence
+        ('201901' -> '201901', '201901.1'), and stripping that suffix
+        before looking for a chronological reset made the reset
+        undetectable — silently misaligning amt_cols/unit_cols by a fixed
+        offset and dragging real amount data into what looked like
+        all-NaN ghost rows.
         """
         all_cols = df.columns.tolist()
 
+        avg_idx = [i for i, c in enumerate(all_cols)
+                   if str(c).strip().lower() == 'avg']
+
+        def _is_month_col(c) -> bool:
+            base = str(c).split('.')[0].strip()
+            return bool(re.match(r'^\d{6}$', base)) and 190001 <= int(base) <= 209912
+
+        if len(avg_idx) >= 2:
+            first, second = avg_idx[0], avg_idx[1]
+            amt_cols = [c for c in all_cols[first + 1:second] if _is_month_col(c)]
+            unit_cols = [c for c in all_cols[second + 1:] if _is_month_col(c)]
+            return amt_cols, unit_cols
+
+        # --- fallback: exactly the old Excel-dtype path, for exports that
+        # for some reason don't carry two 'avg' markers ---
         amt_cols = [c for c in all_cols
                     if isinstance(c, (int, np.integer)) and 190001 <= int(c) <= 209912]
         unit_cols = [c for c in all_cols
@@ -440,17 +477,11 @@ class DataBillContainer:
         if amt_cols:
             return amt_cols, unit_cols
 
-        # --- CSV fallback: positional split ---
-        candidates = []
-        for c in all_cols:
-            base = str(c).split('.')[0].strip()
-            if re.match(r'^\d{6}$', base) and 190001 <= int(base) <= 209912:
-                candidates.append(c)
+        # --- last-resort CSV positional fallback (legacy heuristic) ---
+        candidates = [c for c in all_cols if _is_month_col(c)]
         if not candidates:
             return [], []
 
-        # each block is internally chronological, so the first month that fails
-        # to increase marks the start of the unit block
         boundary = len(candidates)
         running_max = -1
         for i, c in enumerate(candidates):
@@ -461,10 +492,6 @@ class DataBillContainer:
             running_max = max(running_max, m)
 
         return candidates[:boundary], candidates[boundary:]
-
-    # ------------------------------------------------------------------
-    # Build the combined long master table
-    # ------------------------------------------------------------------
 
     def _drop_incomplete_latest_month(self, master: pd.DataFrame) -> pd.DataFrame:
         """
@@ -580,11 +607,18 @@ class DataBillContainer:
         keep = [c for c in keep if c in merged.columns]
         return merged[keep]
 
-    def _melt_mea(self, raw: pd.DataFrame) -> pd.DataFrame:
-        amt_cols, unit_cols = self._mea_month_columns(raw)
+    def _melt_mea(self, raw: pd.DataFrame,
+                  amt_cols: Optional[list] = None,
+                  unit_cols: Optional[list] = None) -> pd.DataFrame:
+        # Reuse the split computed in _load_mea (while raw still had its
+        # 'Avg' marker columns) instead of recomputing here — by this point
+        # raw has been pruned and the markers are gone, so a fresh call
+        # would silently fall back to the fragile positional heuristic.
+        if amt_cols is None or unit_cols is None:
+            amt_cols, unit_cols = self._mea_month_columns(raw)
         logger.info(f"[{raw['company'].iloc[0]}] amt_cols={len(amt_cols)} unit_cols={len(unit_cols)}")
         logger.info(f"[{raw['company'].iloc[0]}] sample amt_cols: {amt_cols[:5]}")
-
+    
         # Melt on just (meter, company); the remaining metadata joins back
         # exactly once at the end. Dragging every meta column through two
         # melts, a merge and the spine used to multiply the string columns
