@@ -59,6 +59,15 @@ MEA_METER_COL = 'Meter_No'
 MEA_SITE_COL_CANDIDATES = ['MSC/RMSC/IBC/WIFI/Decom', 'MSC/RMSC/IBC/WIFI/DeCom']
 MEA_SITE_ID = 'Site_ID'
 
+# Export tools use several spellings for the two identifier headers.  Match
+# them by a separator-insensitive key and keep one canonical spelling inside
+# the ingestion pipeline.
+IDENTIFIER_COLUMN_ALIASES = {
+    'siteid': MEA_SITE_ID,
+    'meterno': MEA_METER_COL,
+    'meternumber': MEA_METER_COL,
+}
+
 PEA_SITE_TYPE_COL_CANDIDATES = ['MSC/RMSC/IBC/WIFI/DeCom', 'MSC/RMSC/IBC/WIFI/DN/PN']
 
 LAST_MONTH_WINDOWS = (3, 6, 9)
@@ -104,6 +113,73 @@ def _fix_numeric_col(col) -> str:
         return str(int(float(col)))
     except Exception:
         return str(col)
+
+
+def _identifier_column_key(column) -> str:
+    """Return a stable key for common identifier-header variations."""
+    text = str(column).replace('\ufeff', '').replace('\u00a0', ' ').strip().casefold()
+    return re.sub(r'[^a-z0-9]+', '', text)
+
+
+def _canonicalise_identifier_columns(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Rename known Site_ID/Meter_No variants, rejecting ambiguous inputs."""
+    matches: dict[str, list[object]] = {}
+    for column in df.columns:
+        canonical = IDENTIFIER_COLUMN_ALIASES.get(_identifier_column_key(column))
+        if canonical is not None:
+            matches.setdefault(canonical, []).append(column)
+
+    ambiguous = {name: columns for name, columns in matches.items() if len(columns) > 1}
+    if ambiguous:
+        details = '; '.join(
+            f"{name}: {', '.join(repr(str(column)) for column in columns)}"
+            for name, columns in ambiguous.items()
+        )
+        raise ValueError(f"{source} file has ambiguous identifier columns ({details}).")
+
+    rename_map = {
+        columns[0]: canonical
+        for canonical, columns in matches.items()
+        if columns[0] != canonical
+    }
+    return df.rename(columns=rename_map)
+
+
+def _require_columns(df: pd.DataFrame, required: tuple[str, ...], source: str) -> None:
+    missing = [column for column in required if column not in df.columns]
+    if not missing:
+        return
+
+    raise ValueError(
+        f"{source} file is missing required column(s): {', '.join(missing)}. "
+        "Accepted Site_ID headers include Site_ID, Site ID, and SiteID; "
+        "accepted Meter_No headers include Meter_No, Meter No, and Meter Number."
+    )
+
+
+def _drop_missing_site_ids(
+    df: pd.DataFrame,
+    report: "LoadReport",
+    source: str,
+) -> pd.DataFrame:
+    """Normalize Site_ID values and remove rows that have no usable ID."""
+    site_ids = (
+        df[MEA_SITE_ID]
+        .astype('string')
+        .str.replace('\u00a0', ' ', regex=False)
+        .str.strip()
+        .str.upper()
+    )
+    missing = site_ids.isna() | site_ids.isin({'', '0', '0.0', 'NAN', 'NONE', 'NULL'})
+    removed = int(missing.sum())
+
+    cleaned = df.loc[~missing].copy()
+    cleaned[MEA_SITE_ID] = site_ids.loc[~missing].astype(str)
+    if removed:
+        report.notes.append(f"Dropped {removed} rows with a missing Site_ID.")
+    if cleaned.empty:
+        raise ValueError(f"{source} file has no rows with a usable Site_ID.")
+    return cleaned
 
 def _normalise_mea_site_type(val) -> str:
     v = str(val).strip().upper()
@@ -225,14 +301,10 @@ class DataBillContainer:
                 rename_map[c] = 'user_number'
         raw = raw.rename(columns=rename_map)
         raw.columns = [_fix_numeric_col(c) for c in raw.columns]
-
-        if 'Site_ID' in raw.columns:
-            raw['Site_ID'] = (
-                raw['Site_ID'].astype(str).str.strip().str.upper()
-                .replace({'0.0': '0', 'NAN': '0', 'NONE': '0', '': '0'})
-            )
-        if 'Meter_No.' in raw.columns and MEA_METER_COL not in raw.columns:
-            raw = raw.rename(columns={'Meter_No.': MEA_METER_COL})
+        source = f"PEA {company}"
+        raw = _canonicalise_identifier_columns(raw, source)
+        _require_columns(raw, (MEA_SITE_ID,), source)
+        raw = _drop_missing_site_ids(raw, report, source)
 
         # Split the two numeric blocks (amount block, then unit block) using the
         # two 'avg' marker columns present in every PEA export.
@@ -317,20 +389,13 @@ class DataBillContainer:
         report.notes.append(f"Dropped {before - len(raw)} rows with invalid site_type "
                              f"({sorted(drop_types)}).")
 
-        # drop Site_ID == '0' (no site attached to meter)
-        if 'Site_ID' in raw.columns:
-            before = len(raw)
-            raw = raw[raw['Site_ID'] != '0']
-            report.notes.append(f"Dropped {before - len(raw)} rows with Site_ID == '0'.")
-
         raw['site_type'] = raw['site_type'].replace('0', 'NORMAL')
         raw['company'] = company
         raw['provider'] = 'PEA'
 
         report.rows_after_clean = len(raw)
         report.removed_rows = report.rows_raw - report.rows_after_clean
-        if 'Site_ID' in raw.columns:
-            self.site_frames[key] = raw[['Site_ID', 'company', 'provider']].copy()
+        self.site_frames[key] = raw[[MEA_SITE_ID, 'company', 'provider']].copy()
         # Melt now and discard the wide raw frame — it is by far the biggest
         # object in memory and nothing downstream needs it after this point.
         self.long_frames[key] = self._melt_pea(raw)
@@ -347,17 +412,15 @@ class DataBillContainer:
 
         raw = _read_any(file, header=1)  # real header is row index 1 in MEA exports
         report.rows_raw = len(raw)
-
-        if MEA_METER_COL not in raw.columns:
-            raise ValueError(
-                f"MEA {company} file has no '{MEA_METER_COL}' column — "
-                "is this the right file / export format?"
-            )
+        source = f"MEA {company}"
+        raw = _canonicalise_identifier_columns(raw, source)
+        _require_columns(raw, (MEA_METER_COL, MEA_SITE_ID), source)
 
         # drop the trailing summary row(s) — Meter_No must be numeric there
         raw = raw[pd.to_numeric(raw[MEA_METER_COL], errors='coerce').notna()]
         raw[MEA_METER_COL] = pd.to_numeric(raw[MEA_METER_COL], errors='coerce')
         raw = raw.dropna(subset=[MEA_METER_COL])
+        raw = _drop_missing_site_ids(raw, report, source)
 
         site_col = next((c for c in MEA_SITE_COL_CANDIDATES if c in raw.columns), None)
         raw['site_type'] = raw[site_col].apply(_normalise_mea_site_type) if site_col else 'NORMAL'
@@ -428,6 +491,8 @@ class DataBillContainer:
         if 'Site_ID' in raw.columns:
             self.site_frames[key] = raw[['Site_ID', 'company', 'provider']].copy()
         self.long_frames[key] = self._melt_mea(raw, amt_cols, unit_cols)
+        self.site_frames[key] = raw[[MEA_SITE_ID, 'company', 'provider']].copy()
+        self.long_frames[key] = self._melt_mea(raw)
         del raw
         gc.collect()
         self.load_reports[key] = report
@@ -525,6 +590,16 @@ class DataBillContainer:
         if not self.long_frames:
             self.master_df = pd.DataFrame()
             return self.master_df
+
+        missing_site_id = [
+            key for key, frame in self.long_frames.items()
+            if MEA_SITE_ID not in frame.columns
+        ]
+        if missing_site_id:
+            raise ValueError(
+                "Loaded file(s) are missing the canonical Site_ID column: "
+                + ", ".join(sorted(missing_site_id))
+            )
 
         self.master_df = None
         gc.collect()

@@ -33,12 +33,12 @@ def pea_csv(site_prefix: str) -> bytes:
     return "\n".join(lines).encode()
 
 
-def mea_csv(site_prefix: str) -> bytes:
+def mea_csv(site_prefix: str, site_id_header: str = "Site_ID") -> bytes:
     # row 0 = junk banner (real header is row index 1); the duplicated month
     # names in the unit block get pandas' '.1' mangling, as in real CSV exports.
     lines = [
         "junk banner line,,,,,,",
-        "Meter_No,Site_ID,MSC/RMSC/IBC/WIFI/Decom,201901,201902,201901,201902",
+        f"Meter_No,{site_id_header},MSC/RMSC/IBC/WIFI/Decom,201901,201902,201901,201902",
         f"201,{site_prefix}9001,0,300,400,30,40",
         f"202,{site_prefix}9002,WIFI,50,0,5,0",
         "total,,,,,,",  # trailing summary row that must be dropped
@@ -113,6 +113,58 @@ def test_upload_and_all_eda_endpoints(client):
         resp.json()  # must be valid JSON (no NaN)
 
     assert client.get("/api/upload/status").json()["rows_total"] > 0
+
+
+def test_three_mea_uploads_accept_site_id_header_variants(client):
+    files = {
+        "mea_bfkt": (
+            "mea_bfkt.csv",
+            io.BytesIO(mea_csv("MBF", "Site ID")),
+            "text/csv",
+        ),
+        "mea_tuc": (
+            "mea_tuc.csv",
+            io.BytesIO(mea_csv("MTU", "SITEID")),
+            "text/csv",
+        ),
+        "mea_tmv": (
+            "mea_tmv.csv",
+            io.BytesIO(mea_csv("MTM", " \ufeffsite-id ")),
+            "text/csv",
+        ),
+    }
+
+    response = client.post("/api/upload", files=files)
+    assert response.status_code == 200, response.text
+    status = response.json()
+    assert set(status["loaded_files"]) == {"mea_bfkt", "mea_tuc", "mea_tmv"}
+    assert set(status["missing_files"]) == {"pea_bfkt", "pea_tuc"}
+
+    sites = client.get("/api/sites")
+    assert sites.status_code == 200, sites.text
+    assert set(sites.json()["site_ids"]) == {
+        "MBF9001", "MBF9002", "MTU9001", "MTU9002", "MTM9001", "MTM9002"
+    }
+    assert client.get("/api/eda/duplicates").status_code == 200
+    assert client.get("/api/eda/common-sites").status_code == 200
+
+
+def test_mea_upload_without_site_id_returns_clear_422(client):
+    response = client.post(
+        "/api/upload",
+        files={
+            "mea_tuc": (
+                "mea_tuc.csv",
+                io.BytesIO(mea_csv("MTU", "Customer_Code")),
+                "text/csv",
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    assert "MEA TUC" in response.text
+    assert "Site_ID" in response.text
+    assert client.get("/api/upload/status").json()["loaded_files"] == []
 
 
 def test_meter_patterns_classification(client):
