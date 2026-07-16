@@ -900,49 +900,76 @@ class DataBillContainer:
 
     def eda_maintenance_sites(self, months_window: int = 6) -> dict:
         """
-        Bill-amount value_counts restricted to the 'maintenance' bucket
-        (0 < bill_amount < 200), plus which sites are currently in maintenance
-        (i.e. had a maintenance-range bill in the last N months) with their
-        provider (PEA/MEA) and company.
+        Return only sites that have bill_class == 'maintenance'
+        for ALL of the last `months_window` consecutive months.
         """
         df = self._df()
-        maint = df[df['bill_class'] == 'maintenance']
-        if MEA_METER_COL not in maint.columns:
-            maint = maint.assign(**{MEA_METER_COL: np.nan})
 
-        vc = maint['bill_amount'].round(2).value_counts().sort_index()
+        if MEA_METER_COL not in df.columns:
+            df = df.assign(**{MEA_METER_COL: np.nan})
 
-        cutoff = df['date'].max() - pd.DateOffset(months=months_window)
-        recent_maint = maint[maint['date'] >= cutoff]
-
-        site_rows = (
-            recent_maint
-            .sort_values('date')
-            .drop_duplicates(subset=['Site_ID', 'provider', 'company'], keep='last')
-            [['Site_ID', MEA_METER_COL, 'provider', 'company', 'site_type',
-              'bill_amount', 'date']]
-            .rename(columns={'date': 'last_maintenance_month'})
-            .sort_values(['provider', 'company', 'Site_ID'])
+        vc = (
+            df[df["bill_class"] == "maintenance"]["bill_amount"]
+            .round(2)
+            .value_counts()
+            .sort_index()
         )
 
-        sites = [
-            {
-                "site_id": r.Site_ID,
-                "meter_no": _meter_str(r.Meter_No),
-                "provider": r.provider,   # PEA or MEA
-                "company": r.company,     # BFKT / TUC / TMV
-                "site_type": None if pd.isna(r.site_type) else str(r.site_type),
-                "bill_amount": float(r.bill_amount),
-                "last_maintenance_month": r.last_maintenance_month.strftime("%Y-%m"),
-            }
-            for r in site_rows.itertuples(index=False)
-        ]
+        # Last N calendar months
+        last_month = df["date"].max().to_period("M")
+        target_months = pd.period_range(
+            end=last_month,
+            periods=months_window,
+            freq="M",
+        )
+
+        df = df.copy()
+        df["month"] = df["date"].dt.to_period("M")
+
+        sites = []
+
+        for (site_id, provider, company), g in df.groupby(
+            ["Site_ID", "provider", "company"]
+        ):
+            # Keep only last record per month
+            g = (
+                g.sort_values("date")
+                .drop_duplicates(subset="month", keep="last")
+                .set_index("month")
+            )
+
+            # Must have all required months
+            if not target_months.isin(g.index).all():
+                continue
+
+            last_n = g.loc[target_months]
+
+            # Every month must be maintenance
+            if not (last_n["bill_class"] == "maintenance").all():
+                continue
+
+            latest = last_n.iloc[-1]
+
+            sites.append({
+                "site_id": latest["Site_ID"],
+                "meter_no": _meter_str(latest[MEA_METER_COL]),
+                "provider": latest["provider"],
+                "company": latest["company"],
+                "site_type": None if pd.isna(latest["site_type"]) else str(latest["site_type"]),
+                "bill_amount": float(latest["bill_amount"]),
+                "last_maintenance_month": latest["date"].strftime("%Y-%m"),
+            })
+
+        sites.sort(key=lambda x: (x["provider"], x["company"], x["site_id"]))
 
         return {
-            "total_maintenance_rows": int(len(maint)),
+            "total_maintenance_rows": int((df["bill_class"] == "maintenance").sum()),
             "unique_amounts": int(vc.shape[0]),
-            "value_counts": [{"amount": float(k), "count": int(v)} for k, v in vc.items()],
-            "maintenance_sites_last_{}_months".format(months_window): sites,
+            "value_counts": [
+                {"amount": float(k), "count": int(v)}
+                for k, v in vc.items()
+            ],
+            f"maintenance_sites_last_{months_window}_months": sites,
             "maintenance_site_count": len(sites),
         }
 
